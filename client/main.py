@@ -3,9 +3,8 @@ main.py — NYX Messenger interactive REPL.
 
 Runs a persistent session with:
   • prompt_toolkit for beautiful line editing
-  • prompt_toolkit Toolkit for mouse support and advanced UI
   • background sync thread that auto-fetches and displays new messages
-  • colored output via rich.console
+  • plain text output (no ANSI escape codes)
 
 Usage:
     python main.py               # Start the REPL
@@ -37,8 +36,8 @@ import db
 import crypto
 import commands
 
-# ── Console for rich output ────────────────────────────────────────────────
-console = Console()
+# ── Console for plain text output (no colors, no ANSI codes) ──────────────
+console = Console(color_system=None, no_color=True, force_terminal=False)
 
 # ── Global state ───────────────────────────────────────────────────────────
 running = True
@@ -48,12 +47,12 @@ sync_event = threading.Event()
 
 def print_banner():
     """Print the NYX startup banner."""
-    console.print()
-    console.print("[bold cyan]╔══════════════════════════════════════╗[/]")
-    console.print("[bold cyan]║         NYX Messenger v1.0           ║[/]")
-    console.print("[bold cyan]║   End-to-End Encrypted Messaging     ║[/]")
-    console.print("[bold cyan]╚══════════════════════════════════════╝[/]")
-    console.print()
+    print()
+    print("+====================================+")
+    print("|         NYX Messenger v1.0         |")
+    print("|   End-to-End Encrypted Messaging   |")
+    print("+====================================+")
+    print()
 
 
 def background_sync(cfg: config.NYXConfig, local_db: db.NYXDatabase, crypto_engine: crypto.NYXCrypto):
@@ -108,7 +107,7 @@ def process_command(line: str, cfg: config.NYXConfig, local_db: db.NYXDatabase,
 
     try:
         if cmd == 'quit' or cmd == 'exit':
-            console.print("[yellow]Goodbye. Stay encrypted.[/]")
+            print("Goodbye. Stay encrypted.")
             running = False
             return False
 
@@ -131,12 +130,12 @@ def process_command(line: str, cfg: config.NYXConfig, local_db: db.NYXDatabase,
 
         elif cmd == 'send':
             if not args:
-                console.print("[red]Usage: send <contact> <message>[/]")
+                print("Usage: send <contact> <message>")
             else:
                 # Split args into contact name and message
                 send_parts = args.split(maxsplit=1)
                 if len(send_parts) < 2:
-                    console.print("[red]Usage: send <contact> <message>[/]")
+                    print("Usage: send <contact> <message>")
                 else:
                     contact_name = send_parts[0]
                     message = send_parts[1]
@@ -147,38 +146,38 @@ def process_command(line: str, cfg: config.NYXConfig, local_db: db.NYXDatabase,
 
         elif cmd == 'import':
             if not args:
-                console.print("[red]Usage: import <public_key>[/]")
+                print("Usage: import <public_key>")
             else:
                 commands.import_contact(local_db, args)
 
         elif cmd == 'decrypt':
             if not args:
-                console.print("[red]Usage: decrypt <base64_ciphertext> <base64_nonce>[/]")
+                print("Usage: decrypt <base64_ciphertext> <base64_nonce>")
             else:
                 dec_parts = args.split()
                 if len(dec_parts) < 2:
-                    console.print("[red]Usage: decrypt <base64_ciphertext> <base64_nonce>[/]")
+                    print("Usage: decrypt <base64_ciphertext> <base64_nonce>")
                 else:
                     commands.decrypt_message(crypto_engine, dec_parts[0], dec_parts[1])
 
         elif cmd == 'config':
             if not args:
-                console.print(f"[cyan]Server:[/] {cfg.server_url}")
-                console.print(f"[cyan]DB path:[/] {cfg.db_path}")
+                print(f"Server: {cfg.server_url}")
+                print(f"DB path: {cfg.db_path}")
             else:
                 cfg_parts = args.split(maxsplit=1)
                 if len(cfg_parts) == 2:
                     commands.set_config(cfg, cfg_parts[0], cfg_parts[1])
                 else:
-                    console.print("[red]Usage: config <key> <value>[/]")
-                    console.print("[dim]Available keys: server_url[/]")
+                    print("Usage: config <key> <value>")
+                    print("Available keys: server_url")
 
         elif cmd == 'server':
             if not args:
-                console.print(f"[cyan]Server URL:[/] {cfg.server_url}")
+                print(f"Server URL: {cfg.server_url}")
             else:
                 cfg.set('server_url', args.strip())
-                console.print(f"[green]Server URL set to: {args.strip()}[/]")
+                print(f"Server URL set to: {args.strip()}")
 
         elif cmd == 'clear':
             os.system('clear' if os.name != 'nt' else 'cls')
@@ -187,13 +186,13 @@ def process_command(line: str, cfg: config.NYXConfig, local_db: db.NYXDatabase,
             commands.show_debug_info(crypto_engine, local_db, cfg)
 
         else:
-            console.print(f"[red]Unknown command: {cmd}[/]")
-            console.print("[dim]Type 'help' for available commands.[/]")
+            print(f"Unknown command: {cmd}")
+            print("Type 'help' for available commands.")
 
     except KeyboardInterrupt:
-        console.print("\n[yellow]Command interrupted.[/]")
+        print("\nCommand interrupted.")
     except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
+        print(f"Error: {e}")
         if os.environ.get('NYX_DEBUG'):
             traceback.print_exc()
 
@@ -229,7 +228,7 @@ def run_repl(cfg: config.NYXConfig, local_db: db.NYXDatabase,
                 if not process_command(line, cfg, local_db, crypto_engine):
                     break
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[yellow]Goodbye. Stay encrypted.[/]")
+                print("\nGoodbye. Stay encrypted.")
                 break
 
     # Signal the sync thread to stop
@@ -277,15 +276,15 @@ def main():
 
     # ── Auto-register if needed ────────────────────────────────────────
     if not local_db.is_registered():
-        console.print("[yellow]No local identity found. Generating new identity...[/]")
+        print("No local identity found. Generating new identity...")
         crypto_engine.generate_identity()
         commands.register(cfg, local_db, crypto_engine)
-        console.print()
+        print()
 
     # ── Check connectivity ─────────────────────────────────────────────
-    console.print(f"[dim]Server: {cfg.server_url}[/]")
-    console.print(f"[dim]Identity: {crypto_engine.device_id[:16]}...[/]")
-    console.print()
+    print(f"Server: {cfg.server_url}")
+    print(f"Identity: {crypto_engine.device_id[:16]}...")
+    print()
 
     # ── Run the REPL ───────────────────────────────────────────────────
     run_repl(cfg, local_db, crypto_engine, no_sync=args.no_sync)

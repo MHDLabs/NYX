@@ -430,34 +430,27 @@ class NYXCrypto:
             return ""
         return public_key_bundle_b64(self._identity)
 
-    def encrypt(self, plaintext: str, recipient_device_id: str) -> Tuple[str, str]:
+    def encrypt(self, plaintext: str, recipient_x25519_public: bytes) -> Tuple[str, str]:
         """
         Encrypt a message for a recipient.
 
+        MUST accept recipient's X25519 public key (raw 32 bytes) as parameter.
+        MUST call encrypt_message(plaintext, recipient_x25519_public, self._identity.device_id).
+
         Returns (ciphertext_b64, nonce_b64).
-        Note: this is a simplified encryption that uses the recipient's
-        device_id as a lookup key. The actual X25519 public key of the
-        recipient would need to be resolved from the contact list.
-        For the current implementation, we do a placeholder approach.
         """
         if self._identity is None:
             raise RuntimeError("No identity loaded")
 
-        # For now, we use a direct symmetric-style approach with HKDF
-        # derived from our x25519 private key mixed with recipient device_id.
-        # In a full implementation, we'd ECDH with the recipient's x25519 public key.
-        # This is a placeholder that will be upgraded when key exchange is implemented.
-
-        # Use the legacy encrypt_message for now — it needs the recipient's
-        # x25519 public key. Since we're using placeholder logic, we'll
-        # generate an ephemeral encryption for demonstration.
-        # TODO: Replace with proper key resolution from contacts.
-        enc = encrypt_message(plaintext, self._identity.x25519_public, self._identity.device_id)
+        enc = encrypt_message(plaintext, recipient_x25519_public, self._identity.device_id)
         return enc.ciphertext_b64, enc.nonce_b64
 
-    def decrypt(self, ciphertext_b64: str, nonce_b64: str) -> Optional[str]:
+    def decrypt(self, ciphertext_b64: str, nonce_b64: str, sender_device_id: str) -> Optional[str]:
         """
         Decrypt a message.
+
+        MUST accept sender_device_id as parameter for AAD verification.
+        MUST call decrypt_message(ciphertext_b64, nonce_b64, self._identity.x25519_private, sender_device_id).
 
         Returns the plaintext string, or None on failure.
         """
@@ -469,7 +462,7 @@ class NYXCrypto:
                 ciphertext_b64,
                 nonce_b64,
                 self._identity.x25519_private,
-                self._identity.device_id,
+                sender_device_id,
             )
             return plaintext
         except Exception:

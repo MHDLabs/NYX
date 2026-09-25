@@ -1,32 +1,25 @@
-# Dockerfile — NYX PHP Relay Server
-#
-# Build:  docker build -t nyx-server .
-# Run:    docker run -p 8080:80 nyx-server
+# Dockerfile — NYX PHP Relay Server (Lightweight CLI Mode)
+# No Apache = No MPM conflicts. Perfect for blind relay.
 
-FROM php:8.1-apache
+FROM php:8.1-cli
 
-# Install PDO extensions for PostgreSQL and SQLite
-RUN docker-php-ext-install pdo pdo_mysql pdo_pgsql pdo_sqlite
+# 1. Install system dependencies for PostgreSQL AND SQLite
+RUN apt-get update && apt-get install -y \
+    libpq-dev \
+    libsqlite3-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Enable mod_rewrite for Apache
-RUN a2enmod rewrite
+# 2. Install PHP extensions (PDO, PostgreSQL, SQLite)
+RUN docker-php-ext-install pdo pdo_pgsql pdo_sqlite
 
-# Set the document root to the server directory
-ENV APACHE_DOCUMENT_ROOT=/var/www/html/server
+# 3. Set working directory and copy server files
+WORKDIR /app
+COPY server/ /app/
 
-# Update Apache configuration to use the new document root
-RUN sed -ri -e 's!/var/www/html!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/sites-available/*.conf
-RUN sed -ri -e 's!/var/www/!${APACHE_DOCUMENT_ROOT}!g' /etc/apache2/apache2.conf /etc/apache2/conf-available/*.conf
+# 4. Expose port 8000 (Standard for PHP CLI server, Railway maps this automatically)
+EXPOSE 8000
 
-# Copy server files
-COPY server/ /var/www/html/server/
-
-# Set environment variables (override at runtime)
-ENV DRIVER=sqlite
-ENV DATABASE_URL=""
-
-# Expose port 80
-EXPOSE 80
-
-# Start Apache
-CMD ["apache2-foreground"]
+# 5. Start the PHP built-in server, pointing document root to /app
+# The -t flag ensures that requests like /register.php are routed correctly
+CMD ["php", "-S", "0.0.0.0:8000", "-t", "/app"]

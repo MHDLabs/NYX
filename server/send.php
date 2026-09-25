@@ -47,6 +47,13 @@ if (strlen($ciphertext) > 1048576) {
 $db  = nyx_db();
 $now = nyx_now_sql($db);
 
+// Verify that the sender is a registered device
+$check = $db->prepare("SELECT device_id FROM registered_devices WHERE device_id = :sid");
+$check->execute([':sid' => $senderId]);
+if ($check->fetch() === false) {
+    json_response(403, ['error' => 'Sender not registered. Please register first.']);
+}
+
 // Store the message — ON CONFLICT DO NOTHING prevents duplicates
 $stmt = $db->prepare("
     INSERT INTO messages (message_id, sender_id, recipient_id, ciphertext, nonce, created_at, delivered)

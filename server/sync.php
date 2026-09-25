@@ -62,26 +62,17 @@ $messages = $stmt->fetchAll();
 if (!empty($messages)) {
     $ids = array_column($messages, 'message_id');
 
-    if (nyx_is_pgsql($db)) {
-        // PostgreSQL: use array of parameters for IN clause
-        $placeholders = [];
-        $params = [];
-        foreach ($ids as $i => $id) {
-            $ph = ":id_{$i}";
-            $placeholders[] = $ph;
-            $params[$ph] = $id;
-        }
-        $inClause = implode(', ', $placeholders);
-        $stmt = $db->prepare("UPDATE messages SET delivered = 1 WHERE message_id IN ({$inClause})");
-        $stmt->execute($params);
-    } else {
-        // SQLite: use comma-separated string with IN()
-        $escaped = array_map(function ($id) use ($db) {
-            return "'" . $db->quote($id) . "'";
-        }, $ids);
-        $inClause = implode(',', $escaped);
-        $db->exec("UPDATE messages SET delivered = 1 WHERE message_id IN ({$inClause})");
+    // Use parameterized queries for both SQLite and PostgreSQL
+    $placeholders = [];
+    $params = [];
+    foreach ($ids as $i => $id) {
+        $ph = ":id_{$i}";
+        $placeholders[] = $ph;
+        $params[$ph] = $id;
     }
+    $inClause = implode(', ', $placeholders);
+    $stmt = $db->prepare("UPDATE messages SET delivered = 1 WHERE message_id IN ({$inClause})");
+    $stmt->execute($params);
 }
 
 // ---- Fetch public keys for all known devices ----

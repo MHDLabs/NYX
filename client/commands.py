@@ -11,36 +11,37 @@ No sys.exit() calls — the REPL must keep running.
 from __future__ import annotations
 
 import base64
-import getpass
+import hashlib
 import json
+import uuid
 from typing import Any, Dict, Optional
 
 import requests
 from rich.console import Console
-from rich.table import Table
 
 import config
 import crypto
 import db
 
-console = Console()
+# ── Console for plain text output (no colors, no ANSI codes) ──────────────
+console = Console(color_system=None, no_color=True, force_terminal=False)
 
 
 # ── Error helper ───────────────────────────────────────────────────────────
 
 def _error(msg: str) -> None:
-    """Print a styled error message."""
-    console.print(f"[red][ERROR] {msg}[/]")
+    """Print a plain error message."""
+    print(f"[ERROR] {msg}")
 
 
 def _info(msg: str) -> None:
-    """Print a styled info message."""
-    console.print(f"[cyan][INFO] {msg}[/]")
+    """Print a plain info message."""
+    print(f"[INFO] {msg}")
 
 
 def _success(msg: str) -> None:
-    """Print a styled success message."""
-    console.print(f"[green][OK] {msg}[/]")
+    """Print a plain success message."""
+    print(f"[OK] {msg}")
 
 
 # ── Network helper ─────────────────────────────────────────────────────────
@@ -71,26 +72,23 @@ def _post(cfg: config.NYXConfig, endpoint: str, payload: dict,
 
 def show_help() -> None:
     """Print the help screen."""
-    table = Table(title="NYX Commands", show_header=True,
-                  header_style="bold cyan")
-    table.add_column("Command", style="bold")
-    table.add_column("Description")
-
-    table.add_row("help", "Show this help message")
-    table.add_row("register", "Register your identity with the relay server")
-    table.add_row("myid", "Show your device ID and public key")
-    table.add_row("sync", "Pull new messages from the server")
-    table.add_row("send <contact> <message>", "Send an encrypted message")
-    table.add_row("contacts", "List known contacts (device IDs)")
-    table.add_row("import <public_key>", "Import a contact's public key")
-    table.add_row("decrypt <ciphertext> <nonce>", "Decrypt a message manually")
-    table.add_row("config [key] [value]", "View or set configuration")
-    table.add_row("server [url]", "View or set the relay server URL")
-    table.add_row("clear", "Clear the terminal screen")
-    table.add_row("debug", "Show debug information")
-    table.add_row("quit / exit", "Exit NYX")
-
-    console.print(table)
+    print()
+    print("=== NYX Commands ===")
+    print()
+    print("  help                          Show this help message")
+    print("  register                      Register your identity with the relay server")
+    print("  myid                          Show your device ID and public key")
+    print("  sync                          Pull new messages from the server")
+    print("  send <contact> <message>      Send an encrypted message")
+    print("  contacts                      List known contacts (device IDs)")
+    print("  import <public_key>           Import a contact's public key")
+    print("  decrypt <ciphertext> <nonce>  Decrypt a message manually")
+    print("  config [key] [value]          View or set configuration")
+    print("  server [url]                  View or set the relay server URL")
+    print("  clear                         Clear the terminal screen")
+    print("  debug                         Show debug information")
+    print("  quit / exit                   Exit NYX")
+    print()
 
 
 def register(cfg: config.NYXConfig, local_db: db.NYXDatabase,
@@ -130,10 +128,13 @@ def show_my_id(crypto_engine: crypto.NYXCrypto) -> None:
     device_id = crypto_engine.device_id
     public_key = crypto_engine.get_public_key_b64()
 
-    console.print("[bold]Device Identity[/]")
-    console.print(f"  [cyan]Device ID:[/]    {device_id}")
-    console.print(f"  [cyan]Public Key:[/]   {public_key[:64]}...")
-    console.print(f"  [dim]Key length: {len(public_key)} chars (base64)[/]")
+    print()
+    print("Device Identity")
+    print(f"  Device ID:    {device_id}")
+    print(f"  Public Key:   {public_key}")
+    print(f"  Key length:   {len(public_key)} chars (base64, 64 raw bytes)")
+    print()
+    print("Copy the full public key above to share with other NYX users.")
 
 
 def sync_messages(cfg: config.NYXConfig, local_db: db.NYXDatabase,
@@ -165,13 +166,13 @@ def sync_messages(cfg: config.NYXConfig, local_db: db.NYXDatabase,
             nonce_b64 = msg.get('nonce', '')
             created = msg.get('created_at', '???')
 
-            # Attempt decryption
-            plaintext = crypto_engine.decrypt(ciphertext_b64, nonce_b64)
+            # Attempt decryption with sender_device_id for AAD verification
+            plaintext = crypto_engine.decrypt(ciphertext_b64, nonce_b64, msg.get('sender_id', ''))
 
             if plaintext:
-                console.print(f"  [green]✓[/] [{created}] from {sender}... : {plaintext}")
+                print(f"  [OK] [{created}] from {sender}... : {plaintext}")
             else:
-                console.print(f"  [yellow]✗[/] [{created}] from {sender}... : [encrypted, cannot decrypt]")
+                print(f"  [--] [{created}] from {sender}... : [encrypted, cannot decrypt]")
 
             # Store in local DB
             local_db.save_message(
@@ -213,11 +214,24 @@ def send_message(cfg: config.NYXConfig, local_db: db.NYXDatabase,
         _info("Use 'contacts' to list known contacts, or 'import' to add one.")
         return None
 
-    # ── Encrypt the message ────────────────────────────────────────
-    ciphertext_b64, nonce_b64 = crypto_engine.encrypt(plaintext, recipient_id)
+    # ── Fetch recipient's public key bundle from local DB ─────────
+    recipient_pubkey_bundle = local_db.get_contact(recipient_id)
+    if not recipient_pubkey_bundle:
+        _error(f"No public key found for {recipient_id}")
+        _info("Use 'sync' to discover contacts, or 'import' to add manually.")
+        return None
+
+    # ── Parse the bundle to extract X25519 public key ─────────────
+    try:
+        _, recipient_x25519_pub = crypto.parse_public_key_bundle(recipient_pubkey_bundle)
+    except ValueError as e:
+        _error(f"Invalid public key format: {e}")
+        return None
+
+    # ── Encrypt with recipient's X25519 public key (NOT device_id!)
+    ciphertext_b64, nonce_b64 = crypto_engine.encrypt(plaintext, recipient_x25519_pub)
 
     # ── Generate message ID ────────────────────────────────────────
-    import uuid
     message_id = str(uuid.uuid4())
 
     # ── Send to server ─────────────────────────────────────────────
@@ -264,44 +278,49 @@ def list_contacts(local_db: db.NYXDatabase) -> None:
         _info("No contacts yet. Use 'sync' or 'import' to add contacts.")
         return
 
-    table = Table(title="Known Contacts", show_header=True,
-                  header_style="bold cyan")
-    table.add_column("Device ID", style="bold")
-    table.add_column("Public Key (truncated)")
-
+    print()
+    print("=== Known Contacts ===")
+    print()
+    print(f"  {'Device ID':<20} {'Public Key (truncated)'}")
+    print(f"  {'-'*20} {'-'*40}")
     for cid, ckey in contacts:
-        table.add_row(cid, ckey[:48] + "...")
-
-    console.print(table)
+        print(f"  {cid:<20} {ckey[:48]}...")
+    print()
 
 
 def import_contact(local_db: db.NYXDatabase, public_key_b64: str) -> None:
     """
-    Import a contact by their public key.
-    The device_id is derived from the key (or shown for manual entry).
-    """
-    # We can't derive device_id from public key in Ed25519 without
-    # the convention. For now, ask the user for the device_id, or
-    # display the key and let them add it manually.
-    _info("To import a contact, provide both device_id and public_key.")
-    _info("Use: 'import' then enter the details when prompted.")
+    Import a contact by their public key bundle.
 
-    device_id = input("  Device ID: ").strip()
-    if not device_id:
-        _error("Cannot import without a device ID.")
+    Accepts the 88-character base64 bundle (the exact output of 'myid').
+    The device_id is deterministically derived from the Ed25519 public key:
+      device_id = hashlib.sha256(ed25519_public).hexdigest()[:16]
+    """
+    try:
+        ed_pub, x_pub = crypto.parse_public_key_bundle(public_key_b64.strip())
+    except ValueError:
+        _error("Invalid public key format.")
+        return
+    except Exception:
+        _error("Invalid public key format.")
         return
 
-    local_db.save_contact(device_id, public_key_b64)
-    _success(f"Contact {device_id[:16]}... imported.")
+    device_id = hashlib.sha256(ed_pub).hexdigest()[:16]
+
+    local_db.save_contact(device_id, public_key_b64.strip())
+    _success(f"Contact imported — device_id: {device_id}")
+    print(f"  Ed25519: {ed_pub.hex()[:32]}...")
+    print(f"  X25519:  {x_pub.hex()[:32]}...")
 
 
 def decrypt_message(crypto_engine: crypto.NYXCrypto,
-                    ciphertext_b64: str, nonce_b64: str) -> None:
+                    ciphertext_b64: str, nonce_b64: str,
+                    sender_device_id: str = '') -> None:
     """Manually decrypt a base64 ciphertext + nonce."""
-    plaintext = crypto_engine.decrypt(ciphertext_b64, nonce_b64)
+    plaintext = crypto_engine.decrypt(ciphertext_b64, nonce_b64, sender_device_id)
 
     if plaintext:
-        console.print(f"[green]Decrypted:[/] {plaintext}")
+        print(f"Decrypted: {plaintext}")
     else:
         _error("Decryption failed. Do you have the right key?")
 
@@ -322,12 +341,12 @@ def show_debug_info(crypto_engine: crypto.NYXCrypto,
                     local_db: db.NYXDatabase,
                     cfg: config.NYXConfig) -> None:
     """Show debug information about the current state."""
-    console.print("[bold]Debug Information[/]")
-
-    console.print(f"  [cyan]Config path:[/]    {cfg.config_path}")
-    console.print(f"  [cyan]Server URL:[/]     {cfg.server_url}")
-    console.print(f"  [cyan]DB path:[/]        {cfg.db_path}")
-    console.print(f"  [cyan]Device ID:[/]      {crypto_engine.device_id}")
-    console.print(f"  [cyan]Has identity:[/]   {crypto_engine.has_identity()}")
-    console.print(f"  [cyan]Registered:[/]     {local_db.is_registered()}")
-    console.print(f"  [cyan]Contacts:[/]       {len(local_db.get_contacts())}")
+    print()
+    print("Debug Information")
+    print(f"  Config path:    {cfg.config_path}")
+    print(f"  Server URL:     {cfg.server_url}")
+    print(f"  DB path:        {cfg.db_path}")
+    print(f"  Device ID:      {crypto_engine.device_id}")
+    print(f"  Has identity:   {crypto_engine.has_identity()}")
+    print(f"  Registered:     {local_db.is_registered()}")
+    print(f"  Contacts:       {len(local_db.get_contacts())}")
