@@ -1,25 +1,33 @@
-# Python
+# Byte-compiled / cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-*.egg-info/
-dist/
-build/
-.eggs/
-venv/
+.Python
+
+# Virtual environments
 .venv/
+venv/
+ENV/
+env/
 
-# Local databases
-*.sqlite
-*.db
-*.sqlite3
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
 
-# Config with secrets
-.env
-*.local
+# Testing / coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
 
-# IDE
+# IDE / editors
 .idea/
 .vscode/
 *.swp
@@ -30,10 +38,17 @@ venv/
 .DS_Store
 Thumbs.db
 
+# NYX local data (never commit)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+secrets/
+*.key
+*.pem
+
 # Logs
 *.log
-
-# Temporary
-*.bak
-*.tmp
-*.orig
+logs/

@@ -1,0 +1,22 @@
+# NYX Client configuration example
+# Copy to nyx_data/config/config.toml (or ~/.config/nyx/config.toml)
+
+[network]
+default_server = "http://127.0.0.1:8080"
+max_relays = 5
+connection_timeout = 15
+
+[security]
+require_verified_relay = false
+min_trust_level = 0
+pin_tls_certificates = false
+
+[updates]
+auto_check = true
+channel = "stable"
+
+[logging]
+level = "INFO"
+
+[token]
+allow_local_mine = false

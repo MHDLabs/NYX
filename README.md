@@ -1,172 +1,239 @@
-# Project NYX v0.0.3 — Terminal-Native Encrypted Communication Protocol
+# NYX Client 0.2.x
 
-A privacy-oriented, end-to-end encrypted messaging system with a Python terminal client (interactive REPL) and a PHP relay server. All encryption/decryption happens client-side; the server acts only as a blind relay for ciphertext.
+Terminal-native **secure messaging** client aligned with the **NYX Whitepaper v3.0**.
 
-Supports dual-database deployment: **SQLite** (development) or **PostgreSQL** (production on Railway).
+This is a production-oriented MVP foundation: identity, E2EE DMs, local groups/channels,
+relay register/session, wallet, marketplace, moderation, media sessions, and a professional TUI.
 
-## Architecture
+> Architecture is designed to grow past 100k LOC without rewrites. Extension points are
+> documented in code comments (`# Extension point`).
 
-```
-┌──────────────┐    ciphertext    ┌──────────────┐    ciphertext    ┌──────────────┐
-│   Client A   │ ──────────────► │  PHP Relay   │ ──────────────► │   Client B   │
-│  (Python)    │                  │   Server     │                  │  (Python)    │
-│              │                  │  (blind)     │                  │              │
-│ X25519 + Cha │                  │  Postgres/   │                  │ X25519 + Cha │
-│  REPL mode   │                  │  SQLite      │                  │  REPL mode   │
-└──────────────┘                  └──────────────┘                  └──────────────┘
-```
+---
 
-## Directory Structure
+## Features
 
-```
-nyx/
-├── README.md
-├── server/
-│   ├── index.php          # Router / entry point
-│   ├── register.php       # Public key registration
-│   ├── send.php           # Ciphertext delivery
-│   ├── sync.php           # Ciphertext retrieval
-│   └── db.php             # PDO helper (SQLite + PostgreSQL)
-├── client/
-│   ├── main.py            # Interactive REPL (prompt_toolkit)
-│   ├── config.py          # Config file management (~/.nyx/config.json)
-│   ├── crypto.py          # X25519 + ChaCha20Poly1305 E2EE
-│   ├── db.py              # Local SQLite (NYXDatabase class)
-│   ├── ui.py              # Minimal shim (display in commands.py)
-│   ├── commands.py        # Command implementations (register, send, sync …)
-│   └── requirements.txt   # Python dependencies
-├── Dockerfile             # Server container (PHP + Apache)
-└── railway.json           # Railway deployment config
-```
+| Area | Status |
+|------|--------|
+| Ed25519 identity (`nyx1…`) + BIP39 recovery | Done |
+| Encrypted local profile / SQLite | Done |
+| DM **Double Ratchet** + signed envelopes | Done |
+| Contacts, history, profiles (name/bio) | Done |
+| Groups / channels + **owner-only settings** | Done |
+| Roles: owner / admin / poster / member | Done |
+| **Mute / unmute / kick** (admin+) | Done |
+| Post policy: owner_only / posters / members | Done |
+| Relay: register → session → discovery → profile push | Done |
+| Multi-server directory + scoring | Done |
+| Signed auto-update manifests | Done |
+| **NYX wallet** (address, ledger, export/import keystore, fund) | Done |
+| Marketplace (NYX-only payments) | Done |
+| Attachments + **voice notes** | Done |
+| **Online meetings** (join codes; media stack extension point) | Done |
+| Recovery email (synced on connect) | Done |
+| Themes + custom background preference | Done |
+| REPL + animated curses TUI | Done |
 
-## Prerequisites
+### Explicit non-goals (yet)
 
-- **Python 3.10+**
-- **PHP 8.0+** with PDO and SQLite extensions
-- **pip** (Python package manager)
-- **Docker** (optional, for containerised deployment)
+- Full WebRTC voice/video path (meeting registry is ready for SFU plug-in)
+- On-chain token settlement (wallet is local custody + keystore)
+- Federated moderation gossip
 
-## Setup
+---
 
-### 1. Install Python Dependencies
+## Requirements
+
+- Python **3.11+**
+- `cryptography`
+- `pytest` (tests)
+- Windows TUI: `pip install windows-curses`
 
 ```bash
-cd nyx/client
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install cryptography pytest
+export PYTHONPATH=.         # Windows: set PYTHONPATH=.
 ```
 
-### 2. Start the PHP Relay Server
+---
 
-For local development with SQLite:
+## Quick start
 
 ```bash
-cd nyx/server
-php -S localhost:8080
+python3 -m nyx_client.main --version
+python3 -m nyx_client.main --data-dir /tmp/nyx-alice
+python3 -m nyx_client.main --data-dir /tmp/nyx-alice --tui
+python3 -m nyx_client.main --data-dir /tmp/nyx-alice --repl
+
+python3 -m pytest nyx_client/tests/ -q
+python3 scripts/smoke_test.py
+python3 scripts/demo_dm.py
 ```
 
-The server will be available at `http://localhost:8080`. By default it stores data in `nyx_relay.db`.
+First run prints a **BIP39 mnemonic** — store offline; never share.
 
-For PostgreSQL, set `DATABASE_URL` and `DRIVER=postgres`:
+---
 
-```bash
-export DATABASE_URL="pgsql://user:pass@host:5432/nyx"
-export DRIVER=postgres
-php -S localhost:8080
-```
+## Relay connection
 
-Docker one‑liner:
-
-```bash
-cd nyx
-docker build -t nyx-server .
-docker run -p 8080:80 nyx-server
-```
-
-### 3. Set the Server URL
-
-```bash
-export NYX_SERVER="http://localhost:8080"
-```
-
-Or pass `--server` when starting the REPL:
-
-```bash
-python main.py --server http://localhost:8080
-```
-
-## Usage
-
-### Start the Interactive REPL
-
-```bash
-cd nyx/client
-python main.py
-```
-
-On first launch, NYX automatically generates a new identity and registers it with the relay server.
-
-### Available Commands
-
-Inside the REPL, type `help` to see all commands:
-
-| Command | Description |
-|---|---|
-| `help` | Show this help message |
-| `register` | Register your identity with the relay server |
-| `myid` | Show your device ID and public key |
-| `sync` | Pull new messages from the server |
-| `send <contact> <message>` | Send an encrypted message |
-| `contacts` | List known contacts (device IDs) |
-| `import <public_key>` | Import a contact's public key |
-| `decrypt <ciphertext> <nonce>` | Decrypt a message manually |
-| `config [key] [value]` | View or set configuration |
-| `server [url]` | View or set the relay server URL |
-| `clear` | Clear the terminal screen |
-| `debug` | Show debug information |
-| `quit / exit` | Exit NYX |
-
-### Example Session
+Configure `default_server` in config, then:
 
 ```
-nyx> register
-[INFO] Registering device a1b2c3d4...
-[OK] Registered successfully.
-
-nyx> myid
-Device Identity
-  Device ID:    a1b2c3d4e5f67890
-  Public Key:   AQIDBAUGBwgJCgsMDQ4PEBESExQ...
-
-nyx> sync
-[INFO] No new messages.
-
-nyx> send 99887766 "Hello from NYX!"
-[INFO] Encrypting and sending to 99887766...
-[OK] Message sent to 99887766...
-
-nyx> quit
-Goodbye. Stay encrypted.
+/connect nyx://YOUR_RELAY
 ```
 
-## Security Notes
+Client flow: health → **register** (identity + pubkey + device) → **session** (signed) →
+Bearer token → discovery servers → profile + recovery email push → local persist.
 
-- The PHP server **never** sees plaintext — only base64-encoded ciphertext.
-- Private keys are stored unencrypted locally in `~/.nyx/keys` (file‑system permissions protect them).
-- Each message uses a fresh random ephemeral X25519 key for forward secrecy.
-- ChaCha20-Poly1305 AEAD includes associated data (sender identity) to prevent replay.
-- The server can be hosted behind Tor or any reverse proxy for additional privacy.
+---
 
-## Deployment (Railway)
+## Commands (REPL)
 
-The included `railway.json` and `Dockerfile` are pre-configured for [Railway](https://railway.app). Set the following environment variables in your Railway dashboard:
+### Identity & social
+```
+/identity  /register  /whois <id>  /setname  /setbio  /setemail
+/contacts  /addcontact  /search  /dm
+```
 
-| Variable | Value | Notes |
-|---|---|---|
-| `DATABASE_URL` | `pgsql://…` | Supplied by Railway PostgreSQL plugin |
-| `DRIVER` | `postgres` | Tells db.php to use PostgreSQL |
+### Rooms & moderation
+```
+/newgroup <title>
+/newchannel <title>
+/roomrole <room> <id> <owner|admin|poster|member>   # owner only
+/roompolicy <room> <owner_only|posters|members>     # owner only
+/mute <room> <id> [seconds] [reason]                # admin+
+/unmute <room> <id>
+/kick <room> <id> [reason]
+```
 
-No changes to the PHP code are needed — `db.php` auto-selects the database driver based on the `DRIVER` environment variable.
+### Wallet (Bitcoin-style local custody)
+```
+/wallet                          # address + balance + history
+/fund <amount_nyx>               # deposit / charge
+/walletexport <dir> <passphrase> # encrypted .nks into a folder
+/walletimport <file.nks> <pass> [--replace]
+```
 
-## License
+Address format: `nyxw1…` (derived from identity).  
+Keystore is AEAD-encrypted with PBKDF2-stretched passphrase.  
+**Identity private keys are not inside the keystore** — use BIP39 for account recovery.
 
-MIT
+### Marketplace
+```
+/market [category]
+/sell <price_nyx> <title>
+/buy <listing_id>
+```
+
+### Media
+```
+/attach <target> <path>
+/voice <target> <audio_file> [duration_sec]
+/emoji
+/meeting create <title>
+/meeting list | start <id> | join <code> | end <id>
+```
+
+### Network
+```
+/connect [endpoint]  /servers  /servers refresh  /status  /update
+```
+
+---
+
+## TUI keys
+
+| Key | Action |
+|-----|--------|
+| ↑↓ Enter | Navigate / open chat |
+| 1–4 | Filter all / DM / group / channel |
+| n | Create group/channel |
+| / or f | Search |
+| i | User profile |
+| o | Room settings (owner) |
+| m | Compose |
+| s | Settings |
+| t | Themes |
+| q | Quit |
+
+Unread badge: `(N new)` next to chat titles.
+
+---
+
+## Data layout (all local state)
+
+Everything is stored under the **client working tree**, not on another drive:
+
+```
+./nyx_data/
+  db/           SQLite databases
+  media/        attachments & voice files
+  wallet/       wallet working files
+  keystore/     exported .nks backups (you choose path; prefer here)
+  cache/
+  logs/
+  config/       config.toml
+```
+
+Override only if needed: `storage.data_dir` in config or `--data-dir`.
+
+## NYX token (UTXO) — anti-scam
+
+Public clients **cannot** free-mint coins (`token.allow_local_mine = false`).
+
+Coins enter wallets only via:
+1. Protocol genesis UTXO
+2. **Server-signed mint voucher** (`/claimmint file.json`)
+3. `/claimrelay` after connect (relay `GET /api/v3/token/vouchers/pending`)
+
+See `docs/TOKEN_POLICY.md`.
+
+## NYX token (UTXO)
+
+Spendable coins are **Ed25519-signed UTXO transactions** (`nyx-utxo-v1`).
+Spent outpoints cannot be reused. `/pay` builds+applies locally and broadcasts
+to `POST /api/v3/token/broadcast` when connected. Relays must validate and
+consensus the UTXO set (see `docs/RELAY_API.md`).
+
+## Configuration
+
+`config.example.toml` → `~/.config/nyx/config.toml`
+
+```toml
+[network]
+default_server = "nyx://YOUR_RELAY"
+
+[updates]
+channel = "stable"
+```
+
+---
+
+## Architecture (layers)
+
+```
+ui/          TUI + REPL
+core/        app facade, messaging, wallet, market, meetings
+protocol/    envelopes, session, transport, discovery
+crypto/      keys, AEAD, ratchet, BIP39
+storage/     sqlite, rooms, roles, attachments, prefs
+update/      signed manifests
+```
+
+Each module is independently testable. Prefer extension over breaking APIs.
+
+---
+
+## Development notes
+
+- **Never** leave broken code between milestones; keep tests green.
+- Room **settings** mutations must call `room_roles.require_owner`.
+- Admins may mute/kick **lower ranks only**.
+- Meeting media: implement SFU client behind `MediaSessionStore` without changing message schema.
+- Wallet on-chain: replace `fund()` path with relay/mint proofs; keep address + ledger API stable.
+
+---
+
+## License / whitepaper
+
+Protocol semantics: **NYX Whitepaper v3.0** (project specification).
