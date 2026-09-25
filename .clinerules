@@ -1,0 +1,239 @@
+```markdown
+# Cline Rules for NYX Messenger Project
+
+## 🎯 Project Overview
+NYX is a terminal-native, end-to-end encrypted messaging system with:
+- Python 3.10+ interactive REPL client
+- PHP 8.x blind relay server (SQLite for dev, PostgreSQL for production)
+- X25519 + ChaCha20-Poly1305 E2EE cryptography
+- Railway deployment support
+
+## 📂 Project Structure
+```
+nyx/
+├── server/              # PHP relay server
+│   ├── index.php        # Router/health check
+│   ├── register.php     # Device registration
+│   ├── send.php         # Message relay
+│   ├── sync.php         # Message retrieval
+│   └── db.php           # Database abstraction
+├── client/              # Python client
+│   ├── main.py          # REPL entry point
+│   ├── commands.py      # Command handlers
+│   ├── crypto.py        # Cryptographic operations
+│   ├── db.py            # Local SQLite database
+│   ├── config.py        # Configuration management
+│   ├── ui.py            # UI components (optional)
+│   └── requirements.txt # Python dependencies
+├── Dockerfile           # Server containerization
+└── railway.json         # Railway deployment config
+```
+
+## 🔐 Cryptographic Requirements
+- **NEVER** modify cryptographic primitives without explicit approval
+- Use X25519 for key exchange (ECDH)
+- Use ChaCha20-Poly1305 for AEAD encryption
+- Use Ed25519 for identity/signing
+- Use HKDF-SHA256 for key derivation
+- Device ID = first 16 hex chars of SHA-256(Ed25519 public key)
+- Public key bundle = base64(Ed25519_pub[32] + X25519_pub[32]) = 88 chars
+
+## 🛠️ Coding Standards
+
+### Python Client
+- Use type hints for all function signatures
+- Use `prompt_toolkit` for REPL input
+- Use `rich` for formatted output (but support `no_color=True` mode)
+- All errors should be caught and displayed, never crash the REPL
+- Use `patch_stdout()` when printing from background threads
+- Store config in `~/.nyx/config.json`
+- Store local database in `~/.nyx/nyx_local.db`
+- Store keys in `~/.nyx/keys` and `~/.nyx/device_id`
+
+### PHP Server
+- Use PDO for database abstraction
+- Support both SQLite and PostgreSQL via `DATABASE_URL` environment variable
+- Use parameterized queries (NEVER concatenate SQL)
+- Return JSON responses with proper HTTP status codes
+- Handle CORS preflight (OPTIONS) requests
+- Use `declare(strict_types=1)` in all PHP files
+
+## 🎨 UI/UX Requirements
+
+### First Run Wizard (MANDATORY)
+When no config exists:
+1. Display ASCII art banner
+2. Prompt for server URL with validation
+3. Test connection with spinner animation
+4. Auto-generate identity
+5. Auto-register with server
+6. Display device ID
+
+### Contact System
+- Support optional aliases for contacts
+- Allow sending messages using alias or device_id
+- Store aliases in local database
+- Support sorting by alias or device_id
+
+### Chat Interface (Irssi/WeeChat style)
+- Single window showing all messages
+- Messages color-coded by sender
+- Timestamp, sender, and content displayed
+- Input line at bottom
+- Commands start with `/` or are typed directly
+
+### Themes
+- Default: Matrix (dark with green/cyan)
+- Alternative: Telegram, Monochrome, Solarized
+- Store theme preference in config
+- Apply theme to all UI elements
+
+### Real-time Sync
+- Background thread polls server every N seconds (default: 3)
+- User can enable/disable auto-sync
+- User can change sync interval
+- Display incoming messages immediately
+- Play beep sound on new message (optional)
+
+## 🧪 Testing Requirements
+
+### Local Testing (MANDATORY)
+Before completing any feature:
+1. Test without server (mock responses)
+2. Test with local PHP server
+3. Test with Railway server (if available)
+4. Verify all commands work
+5. Verify error handling
+
+### Test Scenarios
+- First run wizard (delete config, run client)
+- Register identity
+- Import contact with alias
+- Send encrypted message
+- Receive and decrypt message
+- Auto-sync functionality
+- Theme switching
+- Contact list sorting
+
+## 🚫 Restrictions
+
+### DO NOT:
+- Modify cryptographic algorithms without approval
+- Use `input()` in REPL (use `prompt_toolkit` instead)
+- Store plaintext messages in database (only store encrypted)
+- Send private keys to server
+- Use hardcoded credentials
+- Skip error handling
+- Use ANSI escape codes when `no_color=True`
+
+### MUST:
+- Validate all user input
+- Handle network errors gracefully
+- Use parameterized SQL queries
+- Support both SQLite and PostgreSQL
+- Test locally before deployment
+- Use type hints in Python
+- Use strict types in PHP
+
+## 📝 Command Reference
+
+### Client Commands
+```
+help                          - Show help
+register                      - Register with server
+myid                          - Show device ID and public key
+sync                          - Manual sync
+send <contact> <message>      - Send encrypted message
+contacts [--sort alias|id]    - List contacts
+import <public_key>           - Import contact
+alias <device_id> <name>      - Set contact alias
+sync on|off|interval <N>      - Control auto-sync
+theme <name>                  - Change theme
+server [url]                  - View/set server URL
+config <key> <value>          - Set config
+clear                         - Clear screen
+debug                         - Show debug info
+quit|exit                     - Exit
+```
+
+### Server Endpoints
+```
+GET  /                        - Health check
+POST /register.php            - Register device
+POST /send.php                - Send message
+POST /sync.php                - Sync messages
+```
+
+## 🐛 Debugging
+
+### Common Issues
+1. **ANSI codes showing as text**: Set `Console(color_system=None, no_color=True)`
+2. **SQL syntax error**: Use parameterized queries, not string concatenation
+3. **Import error**: Check file paths and `sys.path.insert()`
+4. **Connection error**: Verify server URL and network connectivity
+5. **Decryption failed**: Check AAD (sender_device_id) matches
+
+### Debug Mode
+Set environment variable: `export NYX_DEBUG=1`
+
+## 📦 Dependencies
+
+### Python
+```
+rich>=13.0.0
+cryptography>=41.0.0
+prompt_toolkit>=3.0.0
+requests>=2.28.0
+textual>=0.40.0  # Optional, for advanced TUI
+```
+
+### PHP
+- PHP 8.0+
+- PDO extension
+- PDO_SQLITE extension
+- PDO_PGSQL extension (for Railway)
+
+## 🚀 Deployment
+
+### Local Development
+```bash
+# Start PHP server
+cd server && php -S localhost:8000
+
+# Start Python client
+cd client && python main.py
+```
+
+### Railway Deployment
+1. Push to GitHub
+2. Add PostgreSQL database in Railway
+3. Set `DATABASE_URL` variable (auto-linked)
+4. Railway auto-deploys from `Dockerfile`
+
+## 📚 Additional Notes
+
+- This is a research/learning project
+- Security is paramount - never compromise E2EE
+- Terminal UX should feel professional (like Irssi/WeeChat)
+- Code should be clean, well-commented, and maintainable
+- Always test before committing
+- Use Git for version control
+- Write meaningful commit messages
+
+## 🎯 Current Priorities
+
+1. **First Run Wizard** - Spinner, validation, auto-registration
+2. **Contact Aliases** - Optional names, sorting, resolution
+3. **Auto-sync** - Background thread, configurable interval
+4. **Chat UI** - Irssi-style, color-coded, real-time
+5. **Themes** - Matrix (default), Telegram, Monochrome
+6. **ASCII Art** - Banner, status indicators, separators
+
+## 🔗 Resources
+
+- [Prompt Toolkit Documentation](https://python-prompt-toolkit.readthedocs.io/)
+- [Rich Documentation](https://rich.readthedocs.io/)
+- [Cryptography Library](https://cryptography.io/)
+- [PHP PDO Documentation](https://www.php.net/manual/en/book.pdo.php)
+- [Railway Documentation](https://docs.railway.app/)
+

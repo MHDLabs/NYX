@@ -1,130 +1,172 @@
-# NYX Client 0.2.0
+# Project NYX v0.0.3 — Terminal-Native Encrypted Communication Protocol
 
-**Terminal-native secure messaging client** implementing the NYX Whitepaper v3.0 MVP + auto-update + multi-relay selection.
+A privacy-oriented, end-to-end encrypted messaging system with a Python terminal client (interactive REPL) and a PHP relay server. All encryption/decryption happens client-side; the server acts only as a blind relay for ciphertext.
 
-## Features
+Supports dual-database deployment: **SQLite** (development) or **PostgreSQL** (production on Railway).
 
-| Area | Status |
-|------|--------|
-| Ed25519 identity (`nyx1…`) + BIP39 recovery | Done |
-| Encrypted local profile / SQLite storage | Done |
-| Direct messages with **Double Ratchet** + signed envelopes | Done |
-| Contacts + message history (survives restart) | Done |
-| Session auth + reconnect backoff | Done |
-| **HTTP(S) transport** to relays | Done |
-| **Multi-server directory**, latency probe, composite score | Done |
-| Server discovery from relays | Done |
-| **Auto-update** (relay + GitHub), signed manifest, hash verify | Done |
-| REPL + **curses TUI** | Done |
-| Commands: `/dm` `/servers` `/update` `/connect` `/whois` `/search` … | Done |
-| Groups / channels (local) + room settings | Done |
-| User profiles (name + bio) in chat & search | Done |
+## Architecture
 
-## Requirements
+```
+┌──────────────┐    ciphertext    ┌──────────────┐    ciphertext    ┌──────────────┐
+│   Client A   │ ──────────────► │  PHP Relay   │ ──────────────► │   Client B   │
+│  (Python)    │                  │   Server     │                  │  (Python)    │
+│              │                  │  (blind)     │                  │              │
+│ X25519 + Cha │                  │  Postgres/   │                  │ X25519 + Cha │
+│  REPL mode   │                  │  SQLite      │                  │  REPL mode   │
+└──────────────┘                  └──────────────┘                  └──────────────┘
+```
 
-- Python **3.11+**
-- `cryptography`
-- `pytest` (tests only)
+## Directory Structure
+
+```
+nyx/
+├── README.md
+├── server/
+│   ├── index.php          # Router / entry point
+│   ├── register.php       # Public key registration
+│   ├── send.php           # Ciphertext delivery
+│   ├── sync.php           # Ciphertext retrieval
+│   └── db.php             # PDO helper (SQLite + PostgreSQL)
+├── client/
+│   ├── main.py            # Interactive REPL (prompt_toolkit)
+│   ├── config.py          # Config file management (~/.nyx/config.json)
+│   ├── crypto.py          # X25519 + ChaCha20Poly1305 E2EE
+│   ├── db.py              # Local SQLite (NYXDatabase class)
+│   ├── ui.py              # Minimal shim (display in commands.py)
+│   ├── commands.py        # Command implementations (register, send, sync …)
+│   └── requirements.txt   # Python dependencies
+├── Dockerfile             # Server container (PHP + Apache)
+└── railway.json           # Railway deployment config
+```
+
+## Prerequisites
+
+- **Python 3.10+**
+- **PHP 8.0+** with PDO and SQLite extensions
+- **pip** (Python package manager)
+- **Docker** (optional, for containerised deployment)
+
+## Setup
+
+### 1. Install Python Dependencies
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install cryptography pytest
-export PYTHONPATH=.
+cd nyx/client
+pip install -r requirements.txt
 ```
 
-## Quick start (group testing)
+### 2. Start the PHP Relay Server
+
+For local development with SQLite:
 
 ```bash
-# Version
-python3 -m nyx_client.main --version
-
-# First run creates identity + recovery mnemonic (SAVE IT OFFLINE)
-python3 -m nyx_client.main --data-dir /tmp/nyx-alice
-
-# Interactive
-python3 -m nyx_client.main --data-dir /tmp/nyx-alice --repl
-python3 -m nyx_client.main --data-dir /tmp/nyx-alice --tui
-
-# Automated checks
-python3 scripts/smoke_test.py
-python3 scripts/demo_dm.py
-python3 -m pytest nyx_client/tests/ -q
+cd nyx/server
+php -S localhost:8080
 ```
 
-### REPL commands
+The server will be available at `http://localhost:8080`. By default it stores data in `nyx_relay.db`.
 
-```
-/help
-/status
-/identity
-/contacts
-/addcontact <nyx1...> [name]
-/dm <nyx1...> [message]
-/servers
-/servers refresh
-/connect [endpoint]
-/update
-/update install
-/exit
+For PostgreSQL, set `DATABASE_URL` and `DRIVER=postgres`:
+
+```bash
+export DATABASE_URL="pgsql://user:pass@host:5432/nyx"
+export DRIVER=postgres
+php -S localhost:8080
 ```
 
-## Configuration
+Docker one‑liner:
 
-Copy `config.example.toml` → `~/.config/nyx/config.toml`
-
-Important sections:
-
-```toml
-[network]
-default_server = "nyx://YOUR_RELAY"
-# bootstrap_servers = ["nyx://relay2...", "nyx://relay3..."]
-
-[updates]
-channel = "stable"
-github_manifest_url = "https://raw.githubusercontent.com/ORG/REPO/main/manifest.json"
-release_keys_file = "~/.config/nyx/release_keys.json"
-auto_install = false
+```bash
+cd nyx
+docker build -t nyx-server .
+docker run -p 8080:80 nyx-server
 ```
 
-`release_keys.example.json` shows the format for trusted Ed25519 release public keys.
+### 3. Set the Server URL
 
-## Multi-server selection
+```bash
+export NYX_SERVER="http://localhost:8080"
+```
 
-1. Bootstrap + config servers load into `servers.json`
-2. `/servers refresh` probes latency and asks reachable relays for more servers
-3. Composite score (whitepaper §14): latency, reputation, uptime, trust, capacity
-4. `/connect` uses the highest-scoring reachable relay
+Or pass `--server` when starting the REPL:
 
-## Auto-update trust model
+```bash
+python main.py --server http://localhost:8080
+```
 
-1. Fetch manifest from **relay** and/or **GitHub**
-2. Verify **Ed25519 signature** with configured release keys
-3. Download artifact and verify **hash**
-4. Stage → health check → commit (rollback on failure)
-5. Never installs an unsigned or hash-mismatched build
+## Usage
 
-## Security notes for testers
+### Start the Interactive REPL
 
-- This is a **test build**. Treat it as experimental.
-- Profile key is stored at `data_dir/.profile_key` (mode 0600). Production should use passphrase unlock only.
-- X3DH prekey bundles over the network are not fully deployed; SK is derived via static ECDH then Double Ratchet runs.
-- Only install updates when `release_keys_file` is configured with keys you trust.
-- Do not share recovery mnemonics.
+```bash
+cd nyx/client
+python main.py
+```
 
-## Project layout
+On first launch, NYX automatically generates a new identity and registers it with the relay server.
+
+### Available Commands
+
+Inside the REPL, type `help` to see all commands:
+
+| Command | Description |
+|---|---|
+| `help` | Show this help message |
+| `register` | Register your identity with the relay server |
+| `myid` | Show your device ID and public key |
+| `sync` | Pull new messages from the server |
+| `send <contact> <message>` | Send an encrypted message |
+| `contacts` | List known contacts (device IDs) |
+| `import <public_key>` | Import a contact's public key |
+| `decrypt <ciphertext> <nonce>` | Decrypt a message manually |
+| `config [key] [value]` | View or set configuration |
+| `server [url]` | View or set the relay server URL |
+| `clear` | Clear the terminal screen |
+| `debug` | Show debug information |
+| `quit / exit` | Exit NYX |
+
+### Example Session
 
 ```
-nyx_client/
-  config/     settings, logging
-  crypto/     keys, identity, BIP39, AEAD, Double Ratchet
-  protocol/   envelope, session, connection, HTTP, discovery
-  storage/    SQLite + encrypted profile
-  core/       messaging, commands, app facade
-  update/     signed auto-update
-  ui/         REPL + curses TUI
+nyx> register
+[INFO] Registering device a1b2c3d4...
+[OK] Registered successfully.
+
+nyx> myid
+Device Identity
+  Device ID:    a1b2c3d4e5f67890
+  Public Key:   AQIDBAUGBwgJCgsMDQ4PEBESExQ...
+
+nyx> sync
+[INFO] No new messages.
+
+nyx> send 99887766 "Hello from NYX!"
+[INFO] Encrypting and sending to 99887766...
+[OK] Message sent to 99887766...
+
+nyx> quit
+Goodbye. Stay encrypted.
 ```
+
+## Security Notes
+
+- The PHP server **never** sees plaintext — only base64-encoded ciphertext.
+- Private keys are stored unencrypted locally in `~/.nyx/keys` (file‑system permissions protect them).
+- Each message uses a fresh random ephemeral X25519 key for forward secrecy.
+- ChaCha20-Poly1305 AEAD includes associated data (sender identity) to prevent replay.
+- The server can be hosted behind Tor or any reverse proxy for additional privacy.
+
+## Deployment (Railway)
+
+The included `railway.json` and `Dockerfile` are pre-configured for [Railway](https://railway.app). Set the following environment variables in your Railway dashboard:
+
+| Variable | Value | Notes |
+|---|---|---|
+| `DATABASE_URL` | `pgsql://…` | Supplied by Railway PostgreSQL plugin |
+| `DRIVER` | `postgres` | Tells db.php to use PostgreSQL |
+
+No changes to the PHP code are needed — `db.php` auto-selects the database driver based on the `DRIVER` environment variable.
 
 ## License
 
-MIT — Copyright 2025 Mr.A
+MIT
