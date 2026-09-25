@@ -124,36 +124,53 @@ registry = CommandRegistry()
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _public_key_hex(identity) -> str:
+    """Get X25519 public key as hex string."""
     try:
         return identity.public_key_bytes.hex()
     except Exception:
         return ""
 
 
+def _verify_key_hex(identity) -> str:
+    """Get Ed25519 verify key as hex string."""
+    try:
+        return identity.verify_key_bytes.hex()
+    except Exception:
+        return ""
+
+
 def _device_id(ctx: CommandContext) -> str:
+    """Get device ID, preferring server-assigned value. Generate if missing but not derived from identity."""
     if ctx.device_id:
         return ctx.device_id
-    # Stable device id derived from identity
-    did = "dev_" + hashlib.sha256(ctx.identity_id.encode()).hexdigest()[:24]
+    # Server will assign unique device_id on registration; don't derive locally
+    did = "dev_" + hashlib.uuid4().hex[:24]  # Use UUID instead of SHA256
     ctx.device_id = did
     return did
 
 
 def _v3_session_create(ctx: CommandContext) -> Optional[str]:
-    """Create a v3 session; server currently accepts any signature (placeholder)."""
+    """Create a v3 session with proper Ed25519 signature."""
     device_id = _device_id(ctx)
     ts = int(time.time() * 1000)
-    pub = _public_key_hex(ctx.identity)
-    # Minimal signature placeholder (server validates as true for now)
-    sig = hashlib.sha256(f"{ctx.identity_id}|{device_id}|{pub}|{ts}|3".encode()).hexdigest()
+    pub = _public_key_hex(ctx.identity)  # X25519 public key
+    verify_key = _verify_key_hex(ctx.identity)  # Ed25519 verify key (32 bytes = 64 hex chars)
+    
+    # Create canonical string for signing
+    canonical = f"{ctx.identity_id}|{device_id}|{pub}|{ts}|3"
+    
+    # Sign with Ed25519 signing key
+    signature = ctx.identity.sign(canonical.encode())
+    sig_hex = signature.hex()
 
     body = {
         "identity": ctx.identity_id,
+        "identity_key": verify_key,
         "device_id": device_id,
         "device_public_key": pub or ("00" * 32),
         "timestamp": ts,
         "protocol_version": 3,
-        "signature": sig,
+        "signature": sig_hex,
     }
     try:
         r = requests.post(
@@ -164,11 +181,16 @@ def _v3_session_create(ctx: CommandContext) -> Optional[str]:
         if r.status_code == 200:
             data = r.json()
             token = data.get("session_token")
+            # If server assigned a device_id or verified, update local device_id
+            server_dev_id = data.get("device_id")
+            if server_dev_id:
+                ctx.device_id = server_dev_id
             if token:
                 ctx.session_token = token
                 if ctx.db:
                     ctx.db.set_meta("session_token", token)
-                    ctx.db.set_meta("device_id", device_id)
+                    if ctx.device_id:
+                        ctx.db.set_meta("device_id", ctx.device_id)
                 return token
         return None
     except Exception:
@@ -272,7 +294,7 @@ def cmd_contacts(ctx: CommandContext, args: argparse.Namespace) -> str:
 def cmd_add_contact(ctx: CommandContext, args: argparse.Namespace) -> str:
     if not args.name or not args.identity_id:
         return "Usage: /add <name> <identity_id>"
-    ctx.db.save_contact(args.name, args.identity_id, args.public_key or "")
+    ctx.db.save_contact(args.name, args.identity_id, args.public_key or "", args.verify_key or "")
     return f"Added contact: {args.name}"
 
 
@@ -289,6 +311,21 @@ def cmd_conversations(ctx: CommandContext, args: argparse.Namespace) -> str:
     return "\n".join(lines)
 
 
+def _get_recipient_public_key(ctx: CommandContext, recipient_id: str) -> Optional[bytes]:
+    """Get recipient's X25519 public key from local DB or server sync."""
+    # Try local contacts first
+    contact = ctx.db.get_contact(recipient_id)
+    if contact and contact.get('public_key'):
+        try:
+            return bytes.fromhex(contact['public_key'])
+        except Exception:
+            pass
+    
+    # Could also try to fetch from server /api/v3/keys endpoint
+    # For now, return None if not in local contacts
+    return None
+
+
 def cmd_send(ctx: CommandContext, args: argparse.Namespace) -> str:
     if not args.recipient or not args.message:
         return "Usage: /send <recipient_id> <message>"
@@ -297,12 +334,28 @@ def cmd_send(ctx: CommandContext, args: argparse.Namespace) -> str:
     recipient = args.recipient
     message_id = _make_message_id()
 
-    # Local persist always
+    # Local persist always (store plaintext locally for display)
     conv_id = ctx.db.ensure_conversation([ctx.identity_id, recipient])
     ctx.db.save_message(conv_id, ctx.identity_id, recipient, message, message_id=message_id)
 
     if not ctx.is_connected():
         return f"Message saved locally (offline) to {recipient}"
+
+    # Get recipient's public key for encryption
+    recipient_pubkey = _get_recipient_public_key(ctx, recipient)
+    if not recipient_pubkey:
+        return f"Cannot send: recipient {recipient} public key not found. Add contact with /add command including --public-key"
+
+    # Encrypt message with X25519 + ChaCha20-Poly1305
+    try:
+        ciphertext = ctx.identity.encrypt_for(message.encode('utf-8'), recipient_pubkey)
+        ciphertext_hex = ciphertext.hex()
+    except Exception as e:
+        return f"Encryption failed: {e}"
+
+    # Sign the plaintext message with Ed25519
+    signature = ctx.identity.sign(message.encode('utf-8'))
+    signature_hex = signature.hex()
 
     # Try v3 envelope send
     if _ensure_session(ctx):
@@ -313,9 +366,8 @@ def cmd_send(ctx: CommandContext, args: argparse.Namespace) -> str:
             "conversation_id": conv_id,
             "timestamp": int(time.time() * 1000),
             "sequence": 1,
-            # Blind relay — store plaintext hex as ciphertext for now (crypto upgrade pending)
-            "ciphertext": message.encode("utf-8").hex(),
-            "signature": hashlib.sha256(message.encode()).hexdigest(),
+            "ciphertext": ciphertext_hex,
+            "signature": signature_hex,
             "previous_hash": None,
             "protocol_version": 3,
             "participants": [ctx.identity_id, recipient],
@@ -328,24 +380,30 @@ def cmd_send(ctx: CommandContext, args: argparse.Namespace) -> str:
                 timeout=10,
             )
             if r.status_code == 200:
-                return f"Message sent to {recipient} (v3)"
+                return f"Message sent to {recipient} (v3, encrypted)"
             # fall through to legacy
         except Exception:
             pass
 
-    # Legacy send.php
+    # Legacy send.php (also encrypt for legacy)
     try:
+        # For legacy, we need to split nonce and ciphertext
+        # Box.encrypt returns nonce (24 bytes) + ciphertext + tag
+        nonce = ciphertext[:24]
+        ct_only = ciphertext[24:]
         r = requests.post(
             f"{ctx.server.rstrip('/')}/send.php",
             json={
-                "from_id": ctx.identity_id,
-                "to_id": recipient,
-                "content": message,
+                "message_id": message_id,
+                "sender_id": ctx.identity_id,
+                "recipient_id": recipient,
+                "ciphertext": ct_only.hex(),
+                "nonce": nonce.hex(),
             },
             timeout=10,
         )
         if r.status_code == 200:
-            return f"Message sent to {recipient}"
+            return f"Message sent to {recipient} (legacy, encrypted)"
         return f"Saved locally; server send failed: {r.text[:120]}"
     except Exception as e:
         return f"Saved locally; server error: {e}"
@@ -361,6 +419,50 @@ def cmd_messages(ctx: CommandContext, args: argparse.Namespace) -> str:
     for msg in messages:
         lines.append(f"  [{msg['timestamp']}] {msg['from_id']}: {msg['content']}")
     return "\n".join(lines)
+
+
+def _get_sender_public_key(ctx: CommandContext, sender_id: str) -> Optional[bytes]:
+    """Get sender's X25519 public key from local DB."""
+    contact = ctx.db.get_contact(sender_id)
+    if contact and contact.get('public_key'):
+        try:
+            return bytes.fromhex(contact['public_key'])
+        except Exception:
+            pass
+    return None
+
+
+def _decrypt_message(ctx: CommandContext, sender_id: str, ciphertext_hex: str) -> Optional[str]:
+    """Decrypt a message from sender."""
+    sender_pubkey = _get_sender_public_key(ctx, sender_id)
+    if not sender_pubkey:
+        return None
+    
+    try:
+        ciphertext = bytes.fromhex(ciphertext_hex)
+        plaintext = ctx.identity.decrypt_from(ciphertext, sender_pubkey)
+        return plaintext.decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def _verify_signature(ctx: CommandContext, sender_id: str, message: str, signature_hex: str) -> bool:
+    """Verify Ed25519 signature of a message."""
+    contact = ctx.db.get_contact(sender_id)
+    if not contact or not contact.get('verify_key'):
+        return False
+    
+    try:
+        verify_key_bytes = bytes.fromhex(contact['verify_key'])
+        signature_bytes = bytes.fromhex(signature_hex)
+        
+        # Verify using PyNaCl
+        from nacl.signing import VerifyKey
+        verify_key = VerifyKey(verify_key_bytes)
+        verify_key.verify(message.encode('utf-8'), signature_bytes)
+        return True
+    except Exception:
+        return False
 
 
 def cmd_sync(ctx: CommandContext, args: argparse.Namespace) -> str:
@@ -386,11 +488,20 @@ def cmd_sync(ctx: CommandContext, args: argparse.Namespace) -> str:
                         sender = env.get("sender_id", "")
                         conv = env.get("conversation_id", "")
                         ct = env.get("ciphertext", "")
-                        # ciphertext is hex of utf-8 for our interim scheme
-                        try:
-                            content = bytes.fromhex(ct).decode("utf-8", errors="replace")
-                        except Exception:
-                            content = ct
+                        sig = env.get("signature", "")
+                        
+                        # Verify signature if present
+                        if sig:
+                            if not _verify_signature(ctx, sender, ct, sig):
+                                # Signature verification failed - don't display
+                                continue
+                        
+                        # Decrypt the message
+                        content = _decrypt_message(ctx, sender, ct)
+                        if content is None:
+                            # Could not decrypt - store as-is or skip
+                            content = f"[ENCRYPTED: {ct[:32]}...]"
+                        
                         if not conv or not sender:
                             continue
                         # Determine peer for DM-style local storage
@@ -422,7 +533,7 @@ def cmd_sync(ctx: CommandContext, args: argparse.Namespace) -> str:
     try:
         r = requests.post(
             f"{ctx.server.rstrip('/')}/sync.php",
-            json={"identity_id": ctx.identity_id},
+            json={"user_id": ctx.identity_id},
             timeout=10,
         )
         if r.status_code == 200:
@@ -433,6 +544,18 @@ def cmd_sync(ctx: CommandContext, args: argparse.Namespace) -> str:
                     recipient = msg.get("to_id") or msg.get("recipient_id", ctx.identity_id)
                     content = msg.get("content") or msg.get("ciphertext", "")
                     mid = msg.get("message_id")
+                    
+                    # Try to decrypt legacy format (nonce + ciphertext)
+                    if sender and msg.get("nonce"):
+                        nonce_hex = msg.get("nonce", "")
+                        ct_hex = msg.get("ciphertext", "")
+                        if nonce_hex and ct_hex:
+                            # Combine nonce + ciphertext for decryption
+                            full_ct = bytes.fromhex(nonce_hex + ct_hex)
+                            decrypted = _decrypt_message(ctx, sender, full_ct.hex())
+                            if decrypted:
+                                content = decrypted
+                    
                     if not sender:
                         continue
                     conv = ctx.db.ensure_conversation([ctx.identity_id, sender])
@@ -525,8 +648,73 @@ def cmd_group_send(ctx: CommandContext, args: argparse.Namespace) -> str:
     if not group:
         return f"Unknown group: {room_id}"
     mid = _make_message_id()
+    
+    # Local persist
     ctx.db.save_message(room_id, ctx.identity_id, room_id, message, message_id=mid)
-    return f"Group message saved in {group['title']}"
+    
+    if not ctx.is_connected():
+        return f"Group message saved locally in {group['title']} (offline)"
+    
+    # Get group members
+    members = ctx.db.get_group_members(room_id)
+    if not members:
+        return f"Group has no members: {group['title']}"
+    
+    # Encrypt for each member and send
+    sent_count = 0
+    for member in members:
+        member_id = member['identity_id']
+        if member_id == ctx.identity_id:
+            continue  # Don't send to self
+        
+        # Get member's public key
+        contact = ctx.db.get_contact(member_id)
+        if not contact or not contact.get('public_key'):
+            continue
+        try:
+            member_pubkey = bytes.fromhex(contact['public_key'])
+        except Exception:
+            continue
+        
+        # Encrypt message for this member
+        try:
+            ciphertext = ctx.identity.encrypt_for(message.encode('utf-8'), member_pubkey)
+            ciphertext_hex = ciphertext.hex()
+        except Exception:
+            continue
+        
+        # Sign the plaintext message
+        signature = ctx.identity.sign(message.encode('utf-8'))
+        signature_hex = signature.hex()
+        
+        # Send via v3 endpoint with room_id as conversation_id
+        if _ensure_session(ctx):
+            envelope = {
+                "message_id": mid,
+                "sender_id": ctx.identity_id,
+                "device_id": _device_id(ctx),
+                "conversation_id": room_id,  # Use room_id as conversation_id for groups
+                "timestamp": int(time.time() * 1000),
+                "sequence": 1,
+                "ciphertext": ciphertext_hex,
+                "signature": signature_hex,
+                "previous_hash": None,
+                "protocol_version": 3,
+                "participants": [ctx.identity_id, member_id],
+            }
+            try:
+                r = requests.post(
+                    f"{ctx.server.rstrip('/')}/api/v3/messages/send",
+                    json=envelope,
+                    headers=ctx.auth_headers(),
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    sent_count += 1
+            except Exception:
+                pass
+    
+    return f"Group message sent to {sent_count} members in {group['title']}"
 
 
 def cmd_quit(ctx: CommandContext, args: argparse.Namespace) -> str:
@@ -573,7 +761,8 @@ registry.register("exit", cmd_quit, "Exit")
 cmd_add = registry.register("add", cmd_add_contact, "Add contact")
 cmd_add.parser.add_argument("name", help="Contact name")
 cmd_add.parser.add_argument("identity_id", help="Contact identity ID")
-cmd_add.parser.add_argument("--public-key", dest="public_key", default="", help="Public key")
+cmd_add.parser.add_argument("--public-key", dest="public_key", default="", help="X25519 public key (hex)")
+cmd_add.parser.add_argument("--verify-key", dest="verify_key", default="", help="Ed25519 verify key (hex)")
 
 cmd_send = registry.register("send", cmd_send, "Send message")
 cmd_send.parser.add_argument("recipient", help="Recipient identity ID")

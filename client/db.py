@@ -5,15 +5,65 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    import base64
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+
 
 class NYXDatabase:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, password: Optional[str] = None):
         self.db_path = db_path
         self.conn: Optional[sqlite3.Connection] = None
+        self._fernet: Optional[Fernet] = None
         self._init_db()
+        if password:
+            self._init_encryption(password)
+    
+    def _init_encryption(self, password: str) -> None:
+        """Initialize encryption with a user password."""
+        if not CRYPTO_AVAILABLE:
+            raise RuntimeError("cryptography library not available for encryption")
+        
+        # Derive key from password using PBKDF2 with per-instance random salt
+        salt = self.get_meta('encryption_salt')
+        if not salt:
+            salt = base64.b64encode(os.urandom(16)).decode()
+            self.set_meta('encryption_salt', salt)
+        else:
+            salt = base64.b64decode(salt)
+        
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        self._fernet = Fernet(key)
+    
+    def _encrypt(self, data: str) -> str:
+        """Encrypt a string."""
+        if self._fernet is None:
+            return data
+        return self._fernet.encrypt(data.encode()).decode()
+    
+    def _decrypt(self, data: str) -> str:
+        """Decrypt a string."""
+        if self._fernet is None:
+            return data
+        try:
+            return self._fernet.decrypt(data.encode()).decode()
+        except Exception:
+            return data  # Return as-is if decryption fails
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -32,6 +82,7 @@ class NYXDatabase:
                 identity_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 public_key TEXT,
+                verify_key TEXT,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -195,23 +246,23 @@ class NYXDatabase:
 
     def list_contacts(self) -> List[Dict[str, Any]]:
         rows = self.conn.execute(
-            "SELECT identity_id, name, public_key, added_at FROM contacts ORDER BY name"
+            "SELECT identity_id, name, public_key, verify_key, added_at FROM contacts ORDER BY name"
         ).fetchall()
         return [dict(r) for r in rows]
 
     def save_contact(
-        self, name: str, identity_id: str, public_key: str = ""
+        self, name: str, identity_id: str, public_key: str = "", verify_key: str = ""
     ) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO contacts (identity_id, name, public_key) "
-            "VALUES (?, ?, ?)",
-            (identity_id, name, public_key),
+            "INSERT OR REPLACE INTO contacts (identity_id, name, public_key, verify_key) "
+            "VALUES (?, ?, ?, ?)",
+            (identity_id, name, public_key, verify_key),
         )
         self.conn.commit()
 
     def get_contact(self, identity_id: str) -> Optional[Dict[str, Any]]:
         row = self.conn.execute(
-            "SELECT identity_id, name, public_key FROM contacts WHERE identity_id = ?",
+            "SELECT identity_id, name, public_key, verify_key FROM contacts WHERE identity_id = ?",
             (identity_id,),
         ).fetchone()
         return dict(row) if row else None
