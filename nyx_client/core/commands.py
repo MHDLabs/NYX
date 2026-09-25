@@ -127,11 +127,29 @@ def cmd_identity(ctx: CommandContext, args: List[str]) -> CommandResult:
     return CommandResult(ok=True, message="Identity: " + ctx.identity_id)
 
 
-@registry.register("dm", "Open or send a direct message", "/dm <identity> [message...]")
+@registry.register("dm", "Open or send a direct message", "/dm <identity|@handle> [message...]")
 def cmd_dm(ctx: CommandContext, args: List[str]) -> CommandResult:
     if not args:
-        return CommandResult(ok=False, message="Usage: /dm <identity> [message]")
+        return CommandResult(ok=False, message="Usage: /dm <@handle|nyx1...> [message]")
     peer = args[0]
+    app = ctx.services.get("app")
+    if app is not None and hasattr(app, "resolve_handle"):
+        try:
+            peer = app.resolve_handle(peer)
+        except Exception as exc:
+            return CommandResult(ok=False, message="resolve: " + str(exc))
+    if not str(peer).startswith("nyx1"):
+        return CommandResult(
+            ok=False,
+            message="could not resolve to nyx1 id. Other user must: /connect then /id amir",
+        )
+    # require connection
+    if app is not None and (
+        app.connection is None
+        or app.connection.session is None
+        or not app.connection.session.is_authenticated()
+    ):
+        return CommandResult(ok=False, message="not connected — run /connect <relay-url> first")
     messaging = ctx.services.get("messaging")
     if messaging is None:
         return CommandResult(ok=False, message="messaging service not available")
@@ -148,13 +166,16 @@ def cmd_dm(ctx: CommandContext, args: List[str]) -> CommandResult:
     text = " ".join(args[1:])
     try:
         env = messaging.send_dm(peer, text.encode("utf-8"))
+        # confirm relay accepted
+        if getattr(env, "status", None) and str(getattr(env.status, "value", env.status)) == "failed":
+            return CommandResult(ok=False, message="send failed — check /connect and session")
         return CommandResult(
             ok=True,
-            message="sent seq={0} id={1}...".format(env.sequence, env.message_id[:20]),
+            message="sent to {0} seq={1} id={2}...".format(peer[:20], env.sequence, env.message_id[:18]),
             data=env,
         )
     except Exception as exc:
-        return CommandResult(ok=False, message=str(exc))
+        return CommandResult(ok=False, message="send error: " + str(exc))
 
 
 @registry.register("contacts", "List contacts", "/contacts")
@@ -300,17 +321,29 @@ def cmd_connect(ctx: CommandContext, args: List[str]) -> CommandResult:
         return CommandResult(ok=False, message="connect failed: " + str(exc))
 
 
-@registry.register("newgroup", "Create a private group", "/newgroup <title>")
+@registry.register("newgroup", "Create a group (add public for discoverable)", "/newgroup [public] <title>")
 def cmd_newgroup(ctx: CommandContext, args: List[str]) -> CommandResult:
     app = ctx.services.get("app")
     if app is None:
         return CommandResult(ok=False, message="app not available")
     if not args:
-        return CommandResult(ok=False, message="Usage: /newgroup <title>")
+        return CommandResult(ok=False, message="Usage: /newgroup [public] <title>")
+    public = False
+    if args[0].lower() == "public":
+        public = True
+        args = args[1:]
+    if not args:
+        return CommandResult(ok=False, message="Usage: /newgroup [public] <title>")
     title = " ".join(args)
     try:
-        room = app.create_group(title)
-        return CommandResult(ok=True, message="group created: " + room.title + " (" + room.room_id[:20] + "...)")
+        room = app.create_group(title, public=public)
+        vis = "public" if public else "private"
+        return CommandResult(
+            ok=True,
+            message="group created ({0}): {1}\nid: {2}\nShare id with friends or use public search".format(
+                vis, room.title, room.room_id
+            ),
+        )
     except Exception as exc:
         return CommandResult(ok=False, message=str(exc))
 
@@ -804,48 +837,6 @@ def cmd_voice(ctx: CommandContext, args: List[str]) -> CommandResult:
         return CommandResult(ok=False, message=str(exc))
 
 
-@registry.register("meeting", "Create/list/start/join/end online meetings", "/meeting <create|list|start|join|end> ...")
-def cmd_meeting(ctx: CommandContext, args: List[str]) -> CommandResult:
-    app = ctx.services.get("app")
-    if app is None or app.media_sessions is None or app.identity is None:
-        return CommandResult(ok=False, message="not available")
-    if not args:
-        return CommandResult(
-            ok=False,
-            message="Usage: /meeting create <title> | list | start <id> | join <code> | end <id>",
-        )
-    op = args[0].lower()
-    try:
-        if op == "create":
-            title = " ".join(args[1:]) or "NYX Meeting"
-            m = app.media_sessions.create_meeting(app.identity.id, title)
-            return CommandResult(
-                ok=True,
-                message=f"meeting {m.meeting_id} · code {m.join_code} · status {m.status}",
-            )
-        if op == "list":
-            items = app.media_sessions.list_meetings(host_id=app.identity.id)
-            if not items:
-                return CommandResult(ok=True, message="(no meetings)")
-            lines = [f"  {m.meeting_id}  {m.status:10}  code={m.join_code}  {m.title}" for m in items]
-            return CommandResult(ok=True, message=chr(10).join(lines))
-        if op == "start" and len(args) >= 2:
-            m = app.media_sessions.start_meeting(args[1], app.identity.id)
-            return CommandResult(ok=True, message=f"LIVE {m.meeting_id} code={m.join_code}")
-        if op == "join" and len(args) >= 2:
-            m = app.media_sessions.join_meeting(args[1], app.identity.id)
-            return CommandResult(
-                ok=True,
-                message=f"joined {m.meeting_id} · {m.title} · {len(m.participants)} participants",
-            )
-        if op == "end" and len(args) >= 2:
-            m = app.media_sessions.end_meeting(args[1], app.identity.id)
-            return CommandResult(ok=True, message=f"ended {m.meeting_id}")
-        return CommandResult(ok=False, message="unknown meeting subcommand")
-    except Exception as exc:
-        return CommandResult(ok=False, message=str(exc))
-
-
 
 @registry.register("handle", "Set or check unique username", "/handle [check] <name> | /handle set <name> | /handle room <room_id> <name>")
 def cmd_handle(ctx: CommandContext, args: List[str]) -> CommandResult:
@@ -885,13 +876,14 @@ def cmd_sync(ctx: CommandContext, args: List[str]) -> CommandResult:
     if app.connection is None:
         return CommandResult(ok=False, message="not connected — use /connect first")
     app.messaging._connection = app.connection
-    res = app.messaging.sync_inbox()
+    full = bool(args and args[0].lower() in ("full", "all", "--full", "-f"))
+    res = app.messaging.sync_inbox(full=full)
     if res.get("error"):
         return CommandResult(ok=False, message=str(res["error"]))
     ctx.connected = True
     return CommandResult(
         ok=True,
-        message=f"synced pulled={res.get('pulled', 0)} ingested={res.get('ingested', 0)}",
+        message=f"synced pulled={res.get('pulled', 0)} ingested={res.get('ingested', 0)} full={full}",
     )
 
 
@@ -926,3 +918,162 @@ def cmd_rate(ctx: CommandContext, args: List[str]) -> CommandResult:
         return CommandResult(ok=True, message=f"rated {score}/5")
     except Exception as e:
         return CommandResult(ok=False, message=str(e))
+
+
+@registry.register("joinroom", "Join a group/channel by room id", "/joinroom <room_id>")
+def cmd_joinroom(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if not args:
+        return CommandResult(ok=False, message="Usage: /joinroom <room_id>")
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    try:
+        room = app.join_room(args[0])
+        if room is None:
+            return CommandResult(ok=False, message="join failed")
+        return CommandResult(ok=True, message=f"joined {room.room_id} · {room.title}")
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+@registry.register("whoami", "Show own identity", "/whoami")
+def cmd_whoami(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or app.identity is None:
+        return CommandResult(ok=False, message="not started")
+    return CommandResult(ok=True, message=app.identity.id)
+
+@registry.register("lookup", "Lookup user profile on relay", "/lookup <nyx1...>")
+def cmd_lookup(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if not args:
+        return CommandResult(ok=False, message="Usage: /lookup <identity>")
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not available")
+    data = app.fetch_profile(args[0])
+    if not data:
+        return CommandResult(ok=False, message="not found or offline")
+    name = data.get("display_name") or "(no name)"
+    return CommandResult(ok=True, message=f"{name}\n{data.get('identity_id', args[0])}\ndm_key={'yes' if data.get('dm_public_key') else 'no'}")
+
+
+@registry.register("mine", "Mine NYX tokens on connected relay", "/mine [nonce]")
+def cmd_mine(ctx: CommandContext, args: List[str]) -> CommandResult:
+    app = ctx.services.get("app")
+    if app is None or not app.connection or not app.connection.session:
+        return CommandResult(ok=False, message="not connected")
+    import hashlib, os, time, asyncio
+    cfg = {}
+    try:
+        async def _cfg():
+            return await app.connection.transport.request("GET", "/api/v3/token/mining/config", timeout=10)
+        cfg = asyncio.run(_cfg()) or {}
+    except Exception as exc:
+        return CommandResult(ok=False, message="config: " + str(exc))
+    conf = (cfg.get("config") if isinstance(cfg, dict) else None) or {}
+    diff = int(conf.get("difficulty") or 2)
+    if not conf.get("enabled", True):
+        return CommandResult(ok=False, message="mining disabled on this relay")
+    identity = app.identity.id
+    device = ""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    need = "0" * diff
+    nonce = args[0] if args else None
+    if not nonce:
+        for i in range(5_000_000):
+            nonce = format(i, "x") + os.urandom(4).hex()
+            h = hashlib.sha256(f"{identity}|{nonce}|{device}|{day}".encode()).hexdigest()
+            if h.startswith(need):
+                break
+        else:
+            return CommandResult(ok=False, message="could not find proof (raise attempts)")
+    try:
+        async def _m():
+            return await app.connection.transport.request(
+                "POST", "/api/v3/token/mine", body={"nonce": nonce, "device_id": device}, timeout=30
+            )
+        res = asyncio.run(_m())
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+    if not isinstance(res, dict) or res.get("status") != "ok":
+        return CommandResult(ok=False, message=str(res))
+    return CommandResult(
+        ok=True,
+        message="mined {0} micro · tx {1}".format(res.get("amount_micro"), res.get("txid", "")[:20]),
+    )
+
+
+@registry.register("roomrole", "Set member role in room", "/roomrole <room_id> <identity> <admin|moderator|member|readonly>")
+def cmd_roomrole(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if len(args) < 3:
+        return CommandResult(ok=False, message="Usage: /roomrole <room> <nyx1> <role>")
+    app = ctx.services.get("app")
+    if app is None or not app.connection:
+        return CommandResult(ok=False, message="not connected")
+    import asyncio
+    from urllib.parse import quote
+    room, ident, role = args[0], args[1], args[2]
+    try:
+        async def _r():
+            return await app.connection.transport.request(
+                "POST",
+                f"/api/v3/rooms/{quote(room, safe='')}/role",
+                body={"identity_id": ident, "role": role},
+                timeout=15,
+            )
+        res = asyncio.run(_r())
+        return CommandResult(ok=True, message=str(res))
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+
+@registry.register("roomkick", "Kick member from room", "/roomkick <room_id> <identity>")
+def cmd_roomkick(ctx: CommandContext, args: List[str]) -> CommandResult:
+    if len(args) < 2:
+        return CommandResult(ok=False, message="Usage: /roomkick <room> <nyx1>")
+    app = ctx.services.get("app")
+    if app is None or not app.connection:
+        return CommandResult(ok=False, message="not connected")
+    import asyncio
+    from urllib.parse import quote
+    try:
+        async def _r():
+            return await app.connection.transport.request(
+                "POST",
+                f"/api/v3/rooms/{quote(args[0], safe='')}/kick",
+                body={"identity_id": args[1]},
+                timeout=15,
+            )
+        res = asyncio.run(_r())
+        return CommandResult(ok=True, message=str(res))
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))
+
+# Explicit /id and /setid (always registered)
+@registry.register("id", "Set or show your @username", "/id [name]")
+@registry.register("setid", "Alias of /id", "/setid [name]")
+@registry.register("username", "Alias of /id", "/username [name]")
+def cmd_id(ctx: CommandContext, args: List[str]) -> CommandResult:
+    """Set public @handle on the connected relay, or show current."""
+    app = ctx.services.get("app")
+    if app is None:
+        return CommandResult(ok=False, message="app not ready")
+    if not args:
+        if app.handles and app.identity:
+            rec = None
+            try:
+                rec = app.handles.get_by_target(app.identity.id)
+            except Exception:
+                rec = None
+            if rec is not None:
+                h = getattr(rec, "handle", None) or (rec.get("handle") if isinstance(rec, dict) else None)
+                if h:
+                    return CommandResult(ok=True, message="@" + str(h) + " → " + app.identity.id)
+        return CommandResult(ok=True, message="no @id yet. Connect first, then: /id myname")
+    name = args[0].lstrip("@").strip()
+    if len(name) < 3:
+        return CommandResult(ok=False, message="name too short (min 3)")
+    try:
+        h = app.set_user_handle(name)
+        return CommandResult(ok=True, message="OK — your id is @" + h)
+    except Exception as exc:
+        return CommandResult(ok=False, message=str(exc))

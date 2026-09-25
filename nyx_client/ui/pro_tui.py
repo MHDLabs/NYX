@@ -50,6 +50,7 @@ class Screen(Enum):
     CONTACTS = auto()
     MARKET = auto()
     WALLET = auto()
+    SERVERS = auto()
 
 
 @dataclass
@@ -129,6 +130,10 @@ class ProTUI:
         self.input_prompt = ""
         self.input_callback: Optional[Callable[[str], None]] = None
         self._settings_index = 0
+        self._servers_index = 0
+        self._server_rows = []
+        self._servers_index = 0
+        self._server_rows = []
         self._profile_index = 0
         self._create_index = 0
         self._search_index = 0
@@ -136,6 +141,8 @@ class ProTUI:
         self._search_query = ""
         self._room_focus: Optional[str] = None
         self._room_settings_index = 0
+        self._last_chat_refresh = 0.0
+        self._last_ingest_seen = 0
         self._theme_index = 0
         self._profile_user: Optional[str] = None
         self._splash_ticks = 0
@@ -363,6 +370,32 @@ class ProTUI:
                         else:
                             self._goto(Screen.HOME)
                             self.reload_home()
+                else:
+                    # Live refresh when background auto-sync pulled new mail
+                    try:
+                        res = getattr(self.app, "last_sync_result", None) or {}
+                        ing = int(res.get("ingested") or 0)
+                        if ing > getattr(self, "_last_ingest_seen", 0):
+                            self._last_ingest_seen = ing
+                            if self.screen == Screen.CHAT:
+                                if self.chat_kind == "room" and self.chat_id:
+                                    self.load_chat(
+                                        None,
+                                        conversation_id=self.chat_id,
+                                        kind="room",
+                                        title=self.chat_title,
+                                    )
+                                elif self.chat_peer:
+                                    self.load_chat(
+                                        self.chat_peer,
+                                        kind="dm",
+                                        title=self.chat_title,
+                                    )
+                                self.status = "new messages"
+                            elif self.screen == Screen.HOME:
+                                self.reload_home()
+                    except Exception:
+                        pass
                 continue
             if self.input_mode:
                 if not self._handle_input(ch):
@@ -463,6 +496,10 @@ class ProTUI:
             self._wallet_index = 0
             self._goto(Screen.WALLET)
             self.status = "wallet"
+            return True
+        # Ctrl+L server list / connect
+        if _ctrl(ch, "l"):
+            self._open_servers_screen(probe=False)
             return True
         # Ctrl+R refresh home list
         if _ctrl(ch, "r"):
@@ -611,6 +648,8 @@ class ProTUI:
             elif ch == ord("s"):
                 self._settings_index = 0
                 self._goto(Screen.SETTINGS)
+            elif ch == ord("l"):
+                self._open_servers_screen(probe=False)
             elif ch == ord("w"):
                 self._wallet_index = 0
                 self._goto(Screen.WALLET)
@@ -788,6 +827,41 @@ class ProTUI:
             elif ch == ord("r"):
                 self.status = self._wallet_refresh_status()
 
+        elif self.screen == Screen.SERVERS:
+            items = self._server_menu_items()
+            n = len(items)
+            # letter shortcuts (Latin + case-insensitive) — may fail on non-Latin layouts
+            letter = ""
+            if 32 <= ch <= 126:
+                letter = chr(ch).lower()
+            if ch in (curses.KEY_UP, ord("k")) and n:
+                self._servers_index = (self._servers_index - 1) % n
+            elif ch in (curses.KEY_DOWN, ord("j")) and n:
+                self._servers_index = (self._servers_index + 1) % n
+            elif ch in (10, 13, curses.KEY_ENTER) and n:
+                self._server_menu_activate(items[self._servers_index])
+            elif letter in ("p", "r") or ch in (ord("p"), ord("P"), ord("r"), ord("R")):
+                self._server_do_probe()
+            elif letter == "a" or ch in (ord("a"), ord("A")):
+                self._start_input("Relay URL (http://host/path): ", self._add_server_line)
+            elif letter == "g" or ch in (ord("g"), ord("G")):
+                self._gossip_refresh()
+            elif letter == "c" or ch in (ord("c"), ord("C")):
+                # connect currently highlighted server row if any
+                self._server_menu_activate(items[self._servers_index] if n else None)
+            elif letter in ("q", "b") or ch in (27, ord("q"), ord("b"), ord("Q"), ord("B")):
+                self._goto(Screen.HOME)
+                self.reload_home()
+            # digits 1-9 quick-select server
+            elif letter.isdigit() and letter != "0":
+                idx = int(letter) - 1
+                # skip action rows
+                actions = 3
+                si = actions + idx
+                if si < n:
+                    self._servers_index = si
+                    self._server_menu_activate(items[si])
+            return True
         elif self.screen == Screen.HELP:
             if ch in (10, 13, 27, ord("b"), ord("q")):
                 self._goto(Screen.HOME)
@@ -806,11 +880,31 @@ class ProTUI:
         cid = data.get("conversation_id") or ""
         title = data.get("title") or item.label.split(" (")[0]
         if peer and ctype == "dm":
+            try:
+                if self.app.messaging and self.app.connection:
+                    self.app.messaging._connection = self.app.connection
+                    self.app.messaging.sync_inbox()
+            except Exception:
+                pass
             self.load_chat(peer, kind="dm", title=title)
             self._goto(Screen.CHAT)
             self.status = "DM"
-        elif ctype in ("private_group", "private_channel", "public_channel", "group", "channel"):
+        elif ctype in ("private_group", "private_channel", "public_channel", "group", "channel") or (
+            cid and (str(cid).startswith("grp_") or str(cid).startswith("chn_"))
+        ):
             self._room_focus = cid
+            # Auto-join so membership + history + send work
+            try:
+                if cid and self.app.identity:
+                    self.app.join_room(cid)
+            except Exception as exc:
+                self.status = f"join: {exc}"[:50]
+            try:
+                if self.app.messaging and self.app.connection:
+                    self.app.messaging._connection = self.app.connection
+                    self.app.messaging.sync_inbox()
+            except Exception:
+                pass
             self.load_chat(
                 None,
                 conversation_id=cid,
@@ -818,7 +912,7 @@ class ProTUI:
                 title=title,
             )
             self._goto(Screen.CHAT)
-            self.status = _type_badge(ctype)
+            self.status = "joined " + (_type_badge(ctype) if ctype else "room")
         elif peer:
             self.load_chat(peer, kind="dm", title=title)
             self._goto(Screen.CHAT)
@@ -1139,8 +1233,8 @@ class ProTUI:
                 (self._prefs().get_profile().recovery_email if self._prefs() else "") or "(not set)"
             )),
             MenuItem("contacts", "Contacts", "Ctrl+B"),
-            MenuItem("connect", "Connect & sync inbox", "Ctrl+O"),
-            MenuItem("servers", "Servers & ranking", "latency / trust"),
+            MenuItem("servers", "Relay servers (list / probe / connect)", "Ctrl+L or L"),
+            MenuItem("connect", "Connect best & sync inbox", "Ctrl+O"),
             MenuItem("update", "Check for updates", "signed manifests"),
             MenuItem("back", "< Back to chats", ""),
         ]
@@ -1172,11 +1266,13 @@ class ProTUI:
             try:
                 r = self.app.check_updates()
                 if r.update_available and r.candidate:
-                    self.status = f"update {r.candidate.version} available"
+                    self.status = f"downloading {r.candidate.version}…"
+                    ver = self.app.apply_update()
+                    self.status = f"OK {ver} — restart client"[:70]
                 else:
                     self.status = f"up to date ({r.current_version})"
             except Exception as exc:
-                self.status = str(exc)[:60]
+                self.status = f"update failed: {exc}"[:70]
         elif key == "contacts":
             self._contacts_index = 0
             self._goto(Screen.CONTACTS)
@@ -1189,7 +1285,14 @@ class ProTUI:
             except Exception as exc:
                 self.status = str(exc)[:60]
         elif key == "servers":
-            self.status = "use /servers refresh in --repl for full probe"
+            self._servers_index = 0
+            self._server_rows = []
+            try:
+                self._reload_servers(probe=False)
+            except Exception as exc:
+                self.status = f"servers load: {exc}"[:60]
+            self._goto(Screen.SERVERS)
+            self.status = f"{len(self._server_rows or [])} relays — p=probe Enter=connect"
         elif key == "back":
             self._goto(Screen.HOME)
             self.reload_home()
@@ -1384,6 +1487,16 @@ class ProTUI:
             self._goto(Screen.CHAT)
         elif hit.kind in ("group", "channel"):
             self._room_focus = hit.id
+            try:
+                self.app.join_room(hit.id)
+            except Exception as exc:
+                self.status = f"join: {exc}"[:50]
+            try:
+                if self.app.messaging and self.app.connection:
+                    self.app.messaging._connection = self.app.connection
+                    self.app.messaging.sync_inbox()
+            except Exception:
+                pass
             self.load_chat(None, conversation_id=hit.id, kind="room", title=hit.title)
             self._goto(Screen.CHAT)
         else:
@@ -1465,7 +1578,15 @@ class ProTUI:
         try:
             raw = text.encode("utf-8")
             if self.chat_kind == "room" and self.chat_id:
+                try:
+                    self.app.join_room(self.chat_id)
+                except Exception:
+                    pass
                 self.app.messaging.send_room_message(self.chat_id, raw)
+                try:
+                    self.app.messaging.sync_inbox()
+                except Exception:
+                    pass
                 self.load_chat(
                     None,
                     conversation_id=self.chat_id,
@@ -1583,6 +1704,8 @@ class ProTUI:
             )
         elif self.screen == Screen.WALLET:
             self._draw_wallet(stdscr, body_top, body_h, w)
+        elif self.screen == Screen.SERVERS:
+            self._draw_servers(stdscr, body_top, body_h, w)
         elif self.screen == Screen.HELP:
             self._draw_help(stdscr, body_top, body_h, w)
 
@@ -1853,6 +1976,329 @@ class ProTUI:
             except curses.error:
                 pass
 
+
+
+
+    def _server_menu_items(self) -> List[MenuItem]:
+        """Action rows + server rows so Enter works without letter keys (Persian keyboard safe)."""
+        items: List[MenuItem] = [
+            MenuItem("probe", ">> Probe latency / rank", "measure all"),
+            MenuItem("add", ">> Add relay URL…", "type endpoint"),
+            MenuItem("mesh", ">> Mesh refresh", "pull discovery lists"),
+        ]
+        for i, s in enumerate(self._server_rows or []):
+            ep = getattr(s, "endpoint", None) or getattr(s, "url", None) or str(s)
+            lat = getattr(s, "latency_ms", None)
+            if isinstance(lat, (int, float)) and lat < 9000:
+                meta = f"{int(lat)}ms"
+            else:
+                meta = "—"
+            reach = getattr(s, "reachable", None)
+            if reach is True:
+                meta += " · up"
+            elif reach is False:
+                meta += " · down"
+            trust = getattr(s, "trust_level", "")
+            if trust != "":
+                meta += f" · t{trust}"
+            items.append(MenuItem("server", ep, meta, data=s))
+        return items
+
+    def _server_do_probe(self) -> None:
+        self.status = "probing relays…"
+        try:
+            self._reload_servers(probe=True)
+            ups = sum(1 for s in (self._server_rows or []) if getattr(s, "reachable", None) is True)
+            self.status = f"probe done · {len(self._server_rows or [])} known · {ups} reachable"
+        except Exception as exc:
+            self.status = f"probe error: {exc}"[:60]
+
+    def _server_menu_activate(self, item: Optional[MenuItem]) -> None:
+        if item is None:
+            self.status = "nothing selected"
+            return
+        if item.key == "probe":
+            self._server_do_probe()
+        elif item.key == "add":
+            self._start_input("Relay URL (http://host/path): ", self._add_server_line)
+        elif item.key == "mesh":
+            self._gossip_refresh()
+        elif item.key == "server":
+            s = item.data
+            ep = getattr(s, "endpoint", None) or getattr(s, "url", None) or item.label
+            self._connect_to_endpoint(str(ep))
+        else:
+            self.status = item.key
+
+    def _open_servers_screen(self, probe: bool = False) -> None:
+        """Open servers UI safely (never leave TUI broken)."""
+        self._servers_index = 0
+        try:
+            self._reload_servers(probe=probe)
+        except Exception as exc:
+            log.warning("servers.open_failed", error=str(exc))
+            self._server_rows = self._fallback_server_rows()
+            self.status = f"servers: {exc}"[:60]
+        self._goto(Screen.SERVERS)
+        n = len(self._server_rows or [])
+        self._servers_index = 0  # focus first action: Probe
+        self.status = f"{n} relay(s) — arrows+Enter · or a/p if Latin keyboard"
+
+    def _fallback_server_rows(self) -> list:
+        from types import SimpleNamespace
+        rows = []
+        seen = set()
+        default = ""
+        try:
+            default = str(self.app.settings.network.default_server or "")
+        except Exception:
+            default = ""
+        if default:
+            rows.append(SimpleNamespace(
+                endpoint=default, latency_ms=None, trust_level=2,
+                reachable=None, score=0.0, source="default", id="default",
+            ))
+            seen.add(default.rstrip("/"))
+        # from directory without probe
+        try:
+            if self.app.directory is not None:
+                for s in (self.app.directory.ranked(only_reachable=False) or []):
+                    ep = getattr(s, "endpoint", "") or ""
+                    if ep and ep.rstrip("/") not in seen:
+                        rows.append(s)
+                        seen.add(ep.rstrip("/"))
+        except Exception:
+            pass
+        return rows
+
+    def _gossip_refresh(self) -> None:
+        n_total = 0
+        try:
+            if self.app.directory is None:
+                self.status = "directory not ready"
+                return
+            targets = []
+            for s in list(self._server_rows or [])[:8]:
+                ep = getattr(s, "endpoint", "") or ""
+                if ep:
+                    targets.append(ep)
+            if not targets:
+                try:
+                    targets = [self.app.settings.network.default_server]
+                except Exception:
+                    targets = []
+            for ep in targets:
+                if not ep:
+                    continue
+                try:
+                    n_total += int(self.app.directory.fetch_from_relay(ep, timeout=4.0) or 0)
+                except Exception:
+                    pass
+            self._reload_servers(probe=True)
+            self.status = f"mesh +{n_total} · {len(self._server_rows or [])} known"
+        except Exception as exc:
+            self.status = f"mesh failed: {exc}"[:60]
+
+    def _reload_servers(self, probe: bool = True) -> None:
+        rows = []
+        seen = set()
+        try:
+            if probe and self.app.directory is not None:
+                try:
+                    self.app.refresh_servers(probe=True)
+                except Exception as exc:
+                    log.warning("servers.refresh_failed", error=str(exc))
+                    # still try probe_all only
+                    try:
+                        self.app.directory.probe_all(
+                            timeout=float(self.app.settings.network.connection_timeout or 3)
+                        )
+                    except Exception:
+                        pass
+            ranked = []
+            if self.app.directory is not None:
+                try:
+                    ranked = list(self.app.directory.ranked(only_reachable=False) or [])
+                except TypeError:
+                    ranked = list(self.app.directory.ranked() or [])
+                except Exception as exc:
+                    log.warning("servers.ranked_failed", error=str(exc))
+                    ranked = list(getattr(self.app.directory, "servers", {}) or {}).values()
+            for s in ranked:
+                ep = getattr(s, "endpoint", None) or getattr(s, "url", None) or ""
+                if not ep:
+                    continue
+                key = ep.rstrip("/")
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append(s)
+            default = str(getattr(self.app.settings.network, "default_server", "") or "")
+            if default and default.rstrip("/") not in seen:
+                from types import SimpleNamespace
+                rows.insert(0, SimpleNamespace(
+                    endpoint=default,
+                    latency_ms=None,
+                    trust_level=2,
+                    reachable=None,
+                    score=0.0,
+                    source="default",
+                    id="default",
+                ))
+            if not rows:
+                rows = self._fallback_server_rows()
+        except Exception as exc:
+            log.warning("servers.reload_failed", error=str(exc))
+            rows = self._fallback_server_rows()
+        self._server_rows = rows
+        if self._servers_index >= len(rows):
+            self._servers_index = max(0, len(rows) - 1)
+
+    def _connect_to_endpoint(self, ep: str) -> None:
+        connect_ep = (ep or "").strip()
+        if not connect_ep:
+            self.status = "empty endpoint"
+            return
+        if connect_ep.startswith("nyx://"):
+            connect_ep = "https://" + connect_ep[len("nyx://"):]
+        self.status = f"connecting {connect_ep[:42]}…"
+        try:
+            sess = self.app.connect_sync(endpoint=connect_ep, use_http=True)
+            meta = getattr(sess, "sync_meta", {}) or {}
+            mesh = meta.get("mesh_learned") or meta.get("servers_fetched") or 0
+            self.status = (
+                f"online · sync {meta.get('messages_synced', 0)} · "
+                f"profile={'ok' if meta.get('profile_pushed') else '—'} · mesh +{mesh}"
+            )[:72]
+            try:
+                from dataclasses import replace
+                self.app.settings = replace(
+                    self.app.settings,
+                    network=replace(self.app.settings.network, default_server=connect_ep),
+                )
+            except Exception:
+                pass
+            try:
+                if self.app.directory is not None:
+                    self.app.directory.fetch_from_relay(connect_ep, timeout=5.0)
+                    self._reload_servers(probe=False)
+            except Exception:
+                pass
+            self.reload_home()
+            self._goto(Screen.HOME)
+        except Exception as exc:
+            self.status = f"connect failed: {exc}"[:70]
+
+    def _connect_selected_server(self) -> None:
+        rows = self._server_rows or []
+        if not rows:
+            self.status = "no servers — select Add relay URL"
+            return
+        idx = self._servers_index
+        actions = 3
+        if idx >= actions:
+            idx = idx - actions
+        if idx < 0 or idx >= len(rows):
+            idx = 0
+        s = rows[min(idx, len(rows) - 1)]
+        ep = getattr(s, "endpoint", None) or getattr(s, "url", None) or str(s)
+        self._connect_to_endpoint(str(ep))
+
+    def _add_server_line(self, line: str) -> None:
+        url = (line or "").strip()
+        self.screen = Screen.SERVERS
+        if not url:
+            self.status = "cancelled"
+            return
+        if not (url.startswith("http://") or url.startswith("https://") or url.startswith("nyx://")):
+            url = "http://" + url
+        url = url.rstrip("/")
+        try:
+            from nyx_client.protocol.discovery import ServerInfo
+            if self.app.directory is not None:
+                info = ServerInfo(
+                    id=(url.split("//")[-1])[:48],
+                    endpoint=url,
+                    trust_level=2,
+                    reputation=0.5,
+                    source="manual",
+                )
+                self.app.directory.upsert(info)
+                self.app.directory.save()
+            self.status = f"added {url[:48]}"
+        except Exception as exc:
+            self.status = f"add failed: {exc}"[:60]
+            # still show in list this session
+            from types import SimpleNamespace
+            rows = list(self._server_rows or [])
+            rows.append(SimpleNamespace(
+                endpoint=url, latency_ms=None, trust_level=2,
+                reachable=None, score=0.0, source="manual", id=url[:16],
+            ))
+            self._server_rows = rows
+            return
+        try:
+            self._reload_servers(probe=True)
+        except Exception:
+            self._reload_servers(probe=False)
+
+
+    def _draw_servers(self, stdscr: Any, top: int, body_h: int, w: int) -> None:
+        items = self._server_menu_items()
+        if self._servers_index >= len(items):
+            self._servers_index = max(0, len(items) - 1)
+        lines = [
+            "  RELAY SERVERS  —  Up/Down + Enter  (no Latin keyboard needed)",
+            "  Shortcuts if Latin layout: p=probe  a=add  g=mesh  c=connect",
+            "  " + ("-" * min(58, max(20, w - 6))),
+        ]
+        if not items:
+            lines.append("  (empty)")
+        for i, it in enumerate(items):
+            mark = ">" if i == self._servers_index else " "
+            label = it.label
+            meta = it.meta or ""
+            if it.key == "server":
+                line = f"  {mark} {label}"
+                if meta:
+                    # put meta on right if space
+                    pad = max(1, w - 6 - len(line) - len(meta))
+                    if pad > 2 and len(line) + pad + len(meta) < w - 2:
+                        line = line + (" " * pad) + meta
+                    else:
+                        line = f"  {mark} {label}  ({meta})"
+            else:
+                line = f"  {mark} {label}  [{meta}]" if meta else f"  {mark} {label}"
+            lines.append(line)
+        cur = ""
+        try:
+            if self.app.connection and self.app.connection.session:
+                cur = getattr(self.app.connection.session, "server", "") or ""
+        except Exception:
+            pass
+        lines.append("  " + ("-" * min(58, max(20, w - 6))))
+        lines.append(f"  Active : {cur or '(not connected)'}")
+        try:
+            lines.append(f"  Default: {self.app.settings.network.default_server}")
+        except Exception:
+            pass
+        lines.append("  Esc/q back")
+        for i, line in enumerate(lines):
+            if i >= body_h:
+                break
+            attr = 0
+            # data starts after 3 header lines
+            data_i = i - 3
+            if 0 <= data_i < len(items) and data_i == self._servers_index:
+                try:
+                    attr = curses.color_pair(2) | curses.A_BOLD
+                except Exception:
+                    attr = curses.A_REVERSE
+            try:
+                stdscr.addnstr(top + i, 1, line[: max(1, w - 2)], w - 2, attr)
+            except curses.error:
+                pass
+
     def _draw_help(self, stdscr: Any, top: int, body_h: int, w: int) -> None:
         lines = [
             "  NYX TUI — Keyboard shortcuts",
@@ -1871,7 +2317,8 @@ class ProTUI:
             "    Ctrl+P        Your profile",
             "    Ctrl+S        Settings",
             "    Ctrl+T        Themes",
-            "    Ctrl+O        Connect + auto-sync inbox",
+            "    Ctrl+L        Relay servers (list / speed / connect)",
+            "    Ctrl+O        Connect best + auto-sync inbox",
             "    Ctrl+Y        Sync inbox now",
             "    Ctrl+R        Refresh chat list",
             "    Ctrl+I        Profile of selection",

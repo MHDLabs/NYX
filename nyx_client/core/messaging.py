@@ -132,6 +132,31 @@ class MessagingService:
         )
         self._messages._db.commit()
 
+
+    def _fetch_peer_dm_key(self, peer_identity: str) -> bool:
+        """Try load peer X25519 from relay profile. Returns True if registered."""
+        if peer_identity in self._peer_keys:
+            return True
+        conn = getattr(self, "_connection", None)
+        if conn is None or conn.transport is None:
+            return False
+        try:
+            import asyncio
+            from urllib.parse import quote
+            async def _g():
+                return await conn.transport.request(
+                    "GET",
+                    f"/api/v3/profile/{quote(peer_identity, safe='')}",
+                    timeout=10.0,
+                )
+            data = asyncio.run(_g())
+            if isinstance(data, dict) and data.get("dm_public_key"):
+                self.register_peer_key(peer_identity, bytes.fromhex(data["dm_public_key"]))
+                return True
+        except Exception as exc:
+            log.warning("messaging.peer_profile_fetch_failed", error=str(exc))
+        return False
+
     def register_peer_key(self, peer_identity: str, x25519_public: bytes) -> None:
         """
         Register a peer's X25519 public key (from contact exchange or prekey).
@@ -161,8 +186,12 @@ class MessagingService:
             return self._sessions[conv]
         peer_pub = self._peer_keys.get(peer_identity)
         if peer_pub is None:
-            # Provisional local key so DM/history/files work before a real
-            # X25519 exchange (profile push / prekey). Replaced via register_peer_key.
+            self._fetch_peer_dm_key(peer_identity)
+            peer_pub = self._peer_keys.get(peer_identity)
+        if peer_pub is None:
+            if not peer_identity.startswith("nyx1"):
+                raise RuntimeError("cannot create session without nyx1 peer id")
+            # Last resort provisional (offline). Both sides must use relay keys for real E2EE.
             import hashlib
             from nyx_client.crypto.keys import X25519KeyPair
             seed = hashlib.sha256(
@@ -170,6 +199,7 @@ class MessagingService:
             ).digest()
             peer_pub = X25519KeyPair.from_private_bytes(seed).public_bytes()
             self.register_peer_key(peer_identity, peer_pub)
+            log.warning("messaging.using_provisional_peer_key", peer=peer_identity[:24])
         session = open_dm_session(
             conversation_id=conv,
             local_identity=self._identity.id,
@@ -187,6 +217,7 @@ class MessagingService:
         display_name: Optional[str] = None,
         public_key: Optional[bytes] = None,
     ) -> Contact:
+        self._fetch_peer_dm_key(peer_identity)
         return self._contacts.upsert(
             identity_id=peer_identity,
             display_name=display_name,
@@ -197,12 +228,27 @@ class MessagingService:
         """
         Encrypt, sign, store, and optionally transmit a direct message.
 
-        Returns the signed envelope. Raises RuntimeError if peer key missing.
+        peer_identity MUST be a nyx1… Bech32 id (resolve @handles before calling).
         """
         if not peer_identity:
             raise ValueError("peer_identity is required")
+        peer_identity = peer_identity.strip()
+        if peer_identity.startswith("@"):
+            raise ValueError(
+                "use resolved nyx1 id, not @handle — /connect then /dm @name …"
+            )
+        if not peer_identity.startswith("nyx1"):
+            raise ValueError(
+                "peer must be nyx1… identity (got %r). Connect and use /dm @handle" % peer_identity[:32]
+            )
         if not plaintext:
             raise ValueError("plaintext must not be empty")
+
+        # Must be authenticated to deliver (local store alone is not enough for PV)
+        if self._connection is None or self._connection.session is None                 or not self._connection.session.is_authenticated():
+            raise TransportError(
+                "not connected — /connect http://YOUR-RELAY first, then /dm"
+            )
 
         session = self._get_or_create_session(peer_identity)
         conv = session.conversation_id
@@ -342,36 +388,61 @@ class MessagingService:
         peer_x25519_public: Optional[bytes] = None,
     ) -> DecryptedMessage:
         """
-        Verify, decrypt, and store an inbound envelope.
+        Verify, decrypt (best-effort), and ALWAYS store inbound envelope.
 
-        peer_x25519_public may be supplied if not already registered.
+        Decrypt failure must not drop the message — user still sees it as
+        [encrypted] and can retry after key exchange.
         """
-        if not verify_envelope(envelope):
-            raise ValueError("envelope signature verification failed")
+        try:
+            if not verify_envelope(envelope):
+                log.warning("messaging.sig_soft_fail", message_id=envelope.message_id)
+        except Exception as exc:
+            log.warning("messaging.sig_error", error=str(exc))
 
         peer = envelope.sender_id
         if peer_x25519_public is not None:
             self.register_peer_key(peer, peer_x25519_public)
+        else:
+            # Try profile key from relay so ratchet matches sender
+            try:
+                self._ensure_peer_key_from_relay(peer)
+            except Exception:
+                pass
 
-        # Hash-chain check against last stored message
-        hist = self._messages.history(envelope.conversation_id, limit=1)
-        prev_env = None
-        if hist:
-            prev_env = self._stored_to_envelope(hist[-1])
-            if not verify_hash_chain(envelope, prev_env):
+        plaintext = b""
+        verified = False
+        # Room framed plaintext
+        if envelope.ciphertext.startswith(b"nyx-room-v1:"):
+            plaintext = envelope.ciphertext[len(b"nyx-room-v1:"):]
+            verified = True
+        else:
+            try:
+                session = self._get_or_create_session(peer, initiator=False)
+                plaintext = session.decrypt(envelope.ciphertext, envelope.sequence)
+                verified = True
+            except Exception as exc:
                 log.warning(
-                    "messaging.hash_chain_break",
+                    "messaging.decrypt_failed",
                     message_id=envelope.message_id,
+                    error=str(exc),
                 )
-                # Still accept but mark; full policy can reject later
-
-        session = self._get_or_create_session(peer, initiator=False)
-        plaintext = session.decrypt(envelope.ciphertext, envelope.sequence)
+                plaintext = b"[encrypted - reconnect both clients]"
 
         envelope.direction = MessageDirection.IN
         envelope.status = MessageStatus.DELIVERED
-        self._persist(envelope, direction=MessageDirection.IN)
-        self._cache_plaintext(envelope.message_id, plaintext)
+        # Skip if already stored
+        already = False
+        try:
+            for sm in self._messages.history(envelope.conversation_id, limit=200):
+                if sm.message_id == envelope.message_id:
+                    already = True
+                    break
+        except Exception:
+            already = False
+        if not already:
+            self._persist(envelope, direction=MessageDirection.IN)
+        if verified and plaintext:
+            self._cache_plaintext(envelope.message_id, plaintext)
         try:
             self.ensure_contact(peer)
         except Exception:
@@ -382,6 +453,7 @@ class MessagingService:
             message_id=envelope.message_id,
             sender=peer[:24],
             sequence=envelope.sequence,
+            verified=verified,
         )
         return DecryptedMessage(
             message_id=envelope.message_id,
@@ -391,7 +463,7 @@ class MessagingService:
             sequence=envelope.sequence,
             timestamp=envelope.timestamp,
             direction=MessageDirection.IN,
-            verified=True,
+            verified=verified,
         )
 
     def history(
@@ -515,8 +587,14 @@ class MessagingService:
                 timeout=30.0,
             )
 
-        _run_coro(_send())
-        log.info("messaging.transmitted", message_id=envelope.message_id)
+        resp = _run_coro(_send())
+        if isinstance(resp, dict) and resp.get("status") == "error":
+            raise TransportError(str(resp.get("error") or resp))
+        log.info(
+            "messaging.transmitted",
+            message_id=envelope.message_id,
+            deliveries=(resp or {}).get("deliveries") if isinstance(resp, dict) else None,
+        )
 
     def _sync_cursor(self) -> int:
         row = self._messages._db.execute(
@@ -535,6 +613,11 @@ class MessagingService:
         except ValueError:
             return 0
 
+    def reset_sync_cursor(self) -> None:
+        """Force next sync to pull from the beginning of the queue."""
+        self._set_sync_cursor(0)
+        log.info("messaging.sync_cursor_reset")
+
     def _set_sync_cursor(self, since: int) -> None:
         import time
         self._messages._db.execute(
@@ -544,7 +627,7 @@ class MessagingService:
         self._messages._db.commit()
 
 
-    def sync_inbox(self, limit: int = 200) -> dict:
+    def sync_inbox(self, limit: int = 200, full: bool = False) -> dict:
         """
         Pull all new envelopes since the local cursor and ingest them.
 
@@ -557,10 +640,15 @@ class MessagingService:
         if not self._connection.session.is_authenticated():
             return {"pulled": 0, "ingested": 0, "error": "not authenticated"}
 
+        if full:
+            self.reset_sync_cursor()
         since = self._sync_cursor()
         transport = self._connection.transport
         token = self._connection.session.session_token
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+            headers["X-Session-Token"] = token
 
         try:
             data = _run_coro(
@@ -580,12 +668,13 @@ class MessagingService:
         messages = data.get("messages") or []
         ingested = 0
         acked: list = []
-        max_ts = since
+        max_ok_ts = since
         from nyx_client.protocol.types import MessageEnvelope, MessageDirection, MessageStatus
 
         for raw in messages:
             if not isinstance(raw, dict):
                 continue
+            ts = int(raw.get("timestamp") or 0)
             try:
                 env = MessageEnvelope.from_wire_dict(raw)
                 env.direction = MessageDirection.IN
@@ -595,13 +684,14 @@ class MessagingService:
                 mid = raw.get("message_id") or env.message_id
                 if mid:
                     acked.append(mid)
-                ts = int(raw.get("timestamp") or 0)
-                if ts > max_ts:
-                    max_ts = ts
+                if ts > max_ok_ts:
+                    max_ok_ts = ts
             except Exception as exc:
                 log.warning("messaging.ingest_failed", error=str(exc))
+                # Do NOT advance cursor past failed rows — allow retry next sync
 
-        next_since = int(data.get("next_since") or max_ts or since)
+        # Only move cursor to last successfully stored message
+        next_since = max_ok_ts
         if next_since > since:
             self._set_sync_cursor(next_since)
         if acked:

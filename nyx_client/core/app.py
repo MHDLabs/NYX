@@ -79,6 +79,10 @@ class NyxApp:
         self.media_sessions: Optional[MediaSessionStore] = None
         self.handles: Optional[HandleStore] = None
         self.is_new_identity: bool = False
+        self._sync_thread = None
+        self._sync_stop = None
+        self._sync_interval_sec = 4.0
+        self.last_sync_result: dict = {}
 
     @classmethod
     def from_settings(
@@ -275,26 +279,38 @@ class NyxApp:
         return await self.connection.connect(endpoint)
 
     def _load_release_keys(self) -> dict:
-        """Load {key_id: raw 32-byte Ed25519 public key} from JSON hex map."""
-        path_str = getattr(self.settings.updates, "release_keys_file", "") or ""
-        if not path_str:
-            return {}
-        path = Path(path_str).expanduser()
-        if not path.is_file():
-            log.warning("update.keys_file_missing", path=str(path))
-            return {}
+        """Load {key_id: raw 32-byte Ed25519 public key} from JSON hex map.
+
+        Always includes the built-in relay release key (nyx-release-1) so
+        clients can verify packages published by the standard NYX relay seed.
+        """
+        keys: dict = {}
+        # Built-in key = Identity::fromSeed(sha256("nyx-relay-dev-seed-v1"))
         try:
-            import json
-            data = json.loads(path.read_text())
-            out = {}
-            for kid, hex_key in data.items():
-                raw = bytes.fromhex(hex_key) if isinstance(hex_key, str) else bytes(hex_key)
-                if len(raw) == 32:
-                    out[str(kid)] = raw
-            return out
-        except Exception as exc:
-            log.warning("update.keys_load_failed", error=str(exc))
-            return {}
+            keys["nyx-release-1"] = bytes.fromhex(
+                "52d504e4f6ed5a526dd170e985b1386ed3ce5222b411bf15ea68f5337f886b2b"
+            )
+        except Exception:
+            pass
+        path_str = getattr(self.settings.updates, "release_keys_file", "") or ""
+        if path_str:
+            path = Path(path_str).expanduser()
+            if path.is_file():
+                try:
+                    import json
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        for kid, hx in raw.items():
+                            try:
+                                keys[str(kid)] = bytes.fromhex(str(hx).strip())
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    log.warning("update.keys_load_failed", error=str(exc))
+            else:
+                log.warning("update.keys_file_missing", path=str(path))
+        return keys
+
 
     def fetch_relay_update_manifest(self, endpoint: Optional[str] = None) -> Optional[dict]:
         import json
@@ -305,10 +321,12 @@ class NyxApp:
             return None
         base = normalize_endpoint(ep).rstrip("/")
         url = base + "/api/v3/updates/manifest"
+        if self.updater is not None:
+            self.updater.relay_base_url = base
         try:
             req = urllib.request.Request(
                 url,
-                headers={"Accept": "application/json", "User-Agent": "nyx-client/0.2.0"},
+                headers={"Accept": "application/json", "User-Agent": "nyx-client/0.2.2"},
             )
             with urllib.request.urlopen(
                 req, timeout=float(self.settings.network.connection_timeout)
@@ -335,12 +353,24 @@ class NyxApp:
     def apply_update(self, manifest_dict: Optional[dict] = None) -> str:
         if self.updater is None:
             raise RuntimeError("call start() first")
+        # Ensure relay base for relative artifact URLs
+        try:
+            ep = None
+            if self.connection and self.connection.session:
+                ep = getattr(self.connection.session, "server", None)
+            if not ep:
+                ep = self.settings.network.default_server
+            if ep and self.updater is not None:
+                from nyx_client.protocol.discovery import normalize_endpoint
+                self.updater.relay_base_url = normalize_endpoint(ep).rstrip("/")
+        except Exception:
+            pass
         result = self.check_updates(relay_manifest=manifest_dict)
         if not result.update_available or result.candidate is None:
             return "already-current:" + result.current_version
         path = self.updater.download_and_verify(result.candidate)
         self.updater.install(path, result.candidate)
-        return result.candidate.version
+        return "installed:" + result.candidate.version + " — restart the client"
 
     def connect_sync(self, endpoint: Optional[str] = None, use_http: bool = True):
         """
@@ -377,7 +407,7 @@ class NyxApp:
         return asyncio.run(_run())
 
 
-    def create_group(self, title: str, description: str = "") -> Room:
+    def create_group(self, title: str, description: str = "", public: bool = False) -> Room:
         if not self.identity or not self.rooms:
             raise RuntimeError("not started")
         room = self.rooms.create(
@@ -385,10 +415,11 @@ class NyxApp:
             title=title,
             description=description,
             owner_id=self.identity.id,
-            is_public=False,
+            is_public=public,
         )
         if self.room_roles is not None:
             self.room_roles.set_owner(room.room_id, self.identity.id)
+        self._push_room_to_relay(room)
         return room
 
     def create_channel(self, title: str, description: str = "", public: bool = True) -> Room:
@@ -403,6 +434,8 @@ class NyxApp:
         )
         if self.room_roles is not None:
             self.room_roles.set_owner(room.room_id, self.identity.id)
+        self._push_room_to_relay(room)
+        if self.room_roles is not None:
             # channels default owner_only posting
             from nyx_client.storage.room_roles import POLICY_OWNER_ONLY
             self.room_roles.set_post_policy(room.room_id, POLICY_OWNER_ONLY)
@@ -426,7 +459,207 @@ class NyxApp:
     def search_directory(self, query: str):
         if not self.search:
             raise RuntimeError("not started")
-        return self.search.search(query)
+        hits = list(self.search.search(query))
+        # Merge relay directory (users + public rooms + handles)
+        try:
+            remote = self._relay_directory_search(query)
+            seen = {(h.kind, h.id) for h in hits}
+            for u in remote.get("users") or []:
+                iid = u.get("identity_id") or ""
+                if not iid or (self.identity and iid == self.identity.id):
+                    continue
+                key = ("user", iid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                # cache contact + dm key
+                if self.messaging and u.get("dm_public_key"):
+                    try:
+                        self.messaging.register_peer_key(iid, bytes.fromhex(u["dm_public_key"]))
+                    except Exception:
+                        pass
+                if self.contacts is not None:
+                    try:
+                        self.contacts.upsert(iid, display_name=u.get("display_name") or None)
+                    except Exception:
+                        pass
+                from nyx_client.core.search import SearchHit
+                hits.append(SearchHit(
+                    kind="user",
+                    id=iid,
+                    title=u.get("display_name") or iid[:28],
+                    subtitle=iid[:36],
+                ))
+            for r in remote.get("rooms") or []:
+                rid = r.get("room_id") or ""
+                if not rid:
+                    continue
+                key = ("group" if "group" in (r.get("room_type") or "") else "channel", rid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                from nyx_client.core.search import SearchHit
+                hits.append(SearchHit(
+                    kind=key[0],
+                    id=rid,
+                    title=r.get("title") or rid[:20],
+                    subtitle=(r.get("room_type") or "") + " · public · relay",
+                ))
+            for h in remote.get("handles") or []:
+                hid = h.get("handle") or ""
+                tid = h.get("target_id") or h.get("owner_id") or ""
+                if not hid:
+                    continue
+                from nyx_client.core.search import SearchHit
+                hits.append(SearchHit(
+                    kind="user" if tid.startswith("nyx1") else "group",
+                    id=tid or hid,
+                    title="@" + hid.lstrip("@"),
+                    subtitle=tid[:36] if tid else "handle",
+                ))
+        except Exception as exc:
+            log.warning("app.relay_search_failed", error=str(exc))
+        return hits
+
+    def _relay_directory_search(self, query: str) -> dict:
+        if not (self.connection and self.connection.session and self.connection.session.is_authenticated()):
+            return {}
+        import asyncio
+        from urllib.parse import quote
+        q = quote(query or "")
+        async def _c():
+            return await self.connection.transport.request(
+                "GET",
+                f"/api/v3/directory/search?q={q}&limit=40",
+                timeout=float(self.settings.network.connection_timeout),
+            )
+        data = asyncio.run(_c())
+        return data if isinstance(data, dict) else {}
+
+    def fetch_profile(self, identity_id: str) -> dict:
+        """Fetch remote profile and register DM key when present."""
+        if not identity_id:
+            return {}
+        if not (self.connection and self.connection.session and self.connection.session.is_authenticated()):
+            return {}
+        import asyncio
+        from urllib.parse import quote
+        async def _c():
+            return await self.connection.transport.request(
+                "GET",
+                f"/api/v3/profile/{quote(identity_id, safe='')}",
+                timeout=float(self.settings.network.connection_timeout),
+            )
+        try:
+            data = asyncio.run(_c())
+        except Exception as exc:
+            log.warning("app.profile_fetch_failed", error=str(exc))
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        # register dm key
+        dm = data.get("dm_public_key") or ""
+        if dm and self.messaging is not None:
+            try:
+                self.messaging.register_peer_key(identity_id, bytes.fromhex(dm))
+            except Exception as exc:
+                log.warning("app.peer_key_from_profile_failed", error=str(exc))
+        if self.contacts is not None and data.get("identity_id"):
+            try:
+                self.contacts.upsert(
+                    data["identity_id"],
+                    display_name=data.get("display_name") or None,
+                    public_key=data.get("public_key") or None,
+                )
+            except Exception:
+                pass
+        return data
+
+    def join_room(self, room_id: str):
+        """Join a room by id (relay) and mirror locally."""
+        if not self.identity or not self.rooms:
+            raise RuntimeError("not started")
+        room_meta = None
+        if self.connection and self.connection.session and self.connection.session.is_authenticated():
+            import asyncio
+            from urllib.parse import quote
+            async def _j():
+                # try get then join
+                try:
+                    return await self.connection.transport.request(
+                        "POST",
+                        f"/api/v3/rooms/{quote(room_id, safe='')}/join",
+                        body={},
+                        timeout=float(self.settings.network.connection_timeout),
+                    )
+                except Exception:
+                    return await self.connection.transport.request(
+                        "GET",
+                        f"/api/v3/rooms/{quote(room_id, safe='')}",
+                        timeout=float(self.settings.network.connection_timeout),
+                    )
+            try:
+                room_meta = asyncio.run(_j())
+            except Exception as exc:
+                log.warning("app.room_join_failed", error=str(exc))
+        # local mirror
+        existing = self.rooms.get(room_id)
+        if existing:
+            return existing
+        title = room_id
+        rtype = "private_group"
+        public = False
+        if isinstance(room_meta, dict):
+            rm = room_meta.get("room") or room_meta
+            title = rm.get("title") or title
+            rtype = rm.get("room_type") or rtype
+            public = bool(rm.get("is_public"))
+        # insert via raw SQL if create always makes new id
+        import time
+        now = int(time.time())
+        self.db.execute(
+            """INSERT OR IGNORE INTO rooms(
+                room_id, room_type, title, description, owner_id, is_public, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (room_id, rtype, title, "", self.identity.id, 1 if public else 0, now, now),
+        )
+        self.db.execute(
+            """INSERT OR IGNORE INTO conversations(
+                conversation_id, type, peer_id, title, created_at, updated_at, last_sequence
+            ) VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (room_id, rtype, None, title, now, now),
+        )
+        self.db.commit()
+        if self.room_roles is not None:
+            try:
+                self.room_roles.ensure_member(room_id, self.identity.id)
+            except Exception:
+                pass
+        return self.rooms.get(room_id)
+
+    def _push_room_to_relay(self, room) -> None:
+        if not (self.connection and self.connection.session and self.connection.session.is_authenticated()):
+            return
+        import asyncio
+        body = {
+            "room_type": getattr(room, "room_type", "private_group"),
+            "title": getattr(room, "title", ""),
+            "description": getattr(room, "description", "") or "",
+            "is_public": bool(getattr(room, "is_public", False)),
+            "room_id": getattr(room, "room_id", None),
+        }
+        async def _p():
+            return await self.connection.transport.request(
+                "POST", "/api/v3/rooms", body=body,
+                timeout=float(self.settings.network.connection_timeout),
+            )
+        try:
+            res = asyncio.run(_p())
+            # If relay assigned different id, keep local; user shared local id for private
+            log.info("app.room_pushed", local=getattr(room, "room_id", None), remote=res)
+        except Exception as exc:
+            log.warning("app.room_push_failed", error=str(exc))
+
 
 
 
@@ -517,11 +750,18 @@ class NyxApp:
         try:
             if self.prefs is not None and self.identity is not None:
                 profile = self.prefs.get_profile()
+                dm_hex = ""
+                if self.messaging is not None:
+                    try:
+                        dm_hex = self.messaging.dm_public_key.hex()
+                    except Exception:
+                        dm_hex = ""
                 body = {
                     "identity": self.identity.id,
                     "display_name": profile.display_name or "",
                     "bio": profile.bio or "",
                     "public_key": self.identity.public_key_bytes.hex(),
+                    "dm_public_key": dm_hex,
                     "recovery_email": profile.recovery_email or "",
                 }
                 await transport.request("PUT", "/api/v3/profile", body=body, timeout=timeout)
@@ -538,9 +778,66 @@ class NyxApp:
                 result["messages_pulled"] = int(sync_res.get("pulled") or 0)
             except Exception as exc:
                 log.warning("app.message_sync_failed", error=str(exc))
+            try:
+                self.start_auto_sync(4.0)
+            except Exception as exc:
+                log.warning("app.auto_sync_start_failed", error=str(exc))
+
+        # Full mesh pull from the server we just authenticated to
+        try:
+            if self.directory is not None and getattr(session, "server", None):
+                n = self.directory.fetch_from_relay(
+                    session.server, timeout=timeout
+                )
+                result["mesh_learned"] = n
+        except Exception as exc:
+            log.warning("app.mesh_fetch_failed", error=str(exc))
 
         self._persist_relay_state(session)
         return result
+
+
+    def start_auto_sync(self, interval_sec: float = 4.0) -> None:
+        """Background store-and-pull sync so incoming DMs/rooms appear without manual /sync."""
+        import threading
+        self._sync_interval_sec = max(2.0, float(interval_sec))
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            return
+        self._sync_stop = threading.Event()
+
+        def _loop() -> None:
+            while self._sync_stop is not None and not self._sync_stop.is_set():
+                try:
+                    if (
+                        self.messaging is not None
+                        and self.connection is not None
+                        and self.connection.session is not None
+                        and self.connection.session.is_authenticated()
+                    ):
+                        self.messaging._connection = self.connection
+                        res = self.messaging.sync_inbox()
+                        self.last_sync_result = res or {}
+                        if int(res.get("ingested") or 0) > 0:
+                            log.info(
+                                "app.auto_sync",
+                                pulled=res.get("pulled"),
+                                ingested=res.get("ingested"),
+                            )
+                except Exception as exc:
+                    log.debug("app.auto_sync_error", error=str(exc))
+                if self._sync_stop is None:
+                    break
+                self._sync_stop.wait(self._sync_interval_sec)
+
+        self._sync_thread = threading.Thread(target=_loop, name="nyx-auto-sync", daemon=True)
+        self._sync_thread.start()
+        log.info("app.auto_sync_started", interval=self._sync_interval_sec)
+
+    def stop_auto_sync(self) -> None:
+        if self._sync_stop is not None:
+            self._sync_stop.set()
+        self._sync_thread = None
+        self._sync_stop = None
 
 
     def set_user_handle(self, handle: str, claimed_at_ms: int | None = None) -> str:
@@ -548,6 +845,9 @@ class NyxApp:
             raise RuntimeError("not started")
         import time as _t
         ts = claimed_at_ms if claimed_at_ms is not None else int(_t.time() * 1000)
+        # Prefer relay-first so the other client can resolve
+        if not (self.connection and self.connection.session and self.connection.session.is_authenticated()):
+            raise RuntimeError("connect to relay first, then /id yourname")
         rec = self.handles.claim(
             handle, KIND_USER, self.identity.id, self.identity.id, claimed_at_ms=ts
         )
@@ -605,9 +905,61 @@ class NyxApp:
         return {"status": "available", "message": "available", "handle": h}
 
     def resolve_handle(self, name: str) -> str:
-        if self.handles:
-            return self.handles.resolve(name) or name
-        return name
+        """Map @handle or short name to nyx1 identity (local then relay)."""
+        raw = (name or "").strip()
+        if not raw:
+            return raw
+        if raw.startswith("nyx1"):
+            return raw
+        h = raw.lstrip("@").strip().lower()
+        # local store
+        if self.handles is not None:
+            resolved = self.handles.resolve(h) or self.handles.resolve(raw)
+            if resolved and str(resolved).startswith("nyx1"):
+                return str(resolved)
+            rec = getattr(self.handles, "get", lambda _x: None)(h)
+            if rec is not None:
+                tid = getattr(rec, "target_id", None) or (rec.get("target_id") if isinstance(rec, dict) else None)
+                if tid and str(tid).startswith("nyx1"):
+                    return str(tid)
+        # contacts by display name
+        if self.contacts is not None:
+            try:
+                for c in self.contacts.list_all():
+                    dn = (getattr(c, "display_name", None) or "").lower()
+                    if dn == h and getattr(c, "identity_id", "").startswith("nyx1"):
+                        return c.identity_id
+            except Exception:
+                pass
+        # relay lookup
+        try:
+            import asyncio
+            from urllib.parse import quote
+            if self.connection and self.connection.session and self.connection.session.is_authenticated():
+                async def _g():
+                    return await self.connection.transport.request(
+                        "GET",
+                        f"/api/v3/handles/{quote(h, safe='')}",
+                        timeout=float(self.settings.network.connection_timeout),
+                    )
+                data = asyncio.run(_g())
+                if isinstance(data, dict):
+                    tid = data.get("target_id") or data.get("identity_id") or data.get("owner_id")
+                    if tid and str(tid).startswith("nyx1"):
+                        # cache locally
+                        if self.handles is not None:
+                            try:
+                                from nyx_client.protocol.handles import KIND_USER
+                                self.handles.claim(
+                                    h, KIND_USER, str(tid), str(data.get("owner_id") or tid),
+                                    claimed_at_ms=int(data.get("claimed_at_ms") or 0) or None,
+                                )
+                            except Exception:
+                                pass
+                        return str(tid)
+        except Exception as exc:
+            log.warning("app.resolve_handle_relay_failed", handle=h, error=str(exc))
+        raise ValueError("unknown handle @" + h + " — ask them to /id " + h + " while connected")
 
     def _relay_check_handle(self, handle: str) -> dict:
         if not (self.connection and self.connection.session and self.connection.session.is_authenticated()):
@@ -808,6 +1160,10 @@ class NyxApp:
         )
 
     def stop(self) -> None:
+        try:
+            self.stop_auto_sync()
+        except Exception:
+            pass
 
         if self.connection is not None:
             # Best-effort sync disconnect mark

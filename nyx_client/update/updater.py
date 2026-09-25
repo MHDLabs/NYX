@@ -20,6 +20,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import os
+import os
 import shutil
 import tempfile
 import time
@@ -204,6 +206,7 @@ class UpdateClient:
         self.release_public_keys = release_public_keys or {}
         self.current_version = current_version
         self.auto_install = auto_install
+        self.relay_base_url: str = ""
         self.state = UpdateState.IDLE
         self.update_dir = data_dir / "updates"
         self.update_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +264,14 @@ class UpdateClient:
             raise ValueError("manifest signature verification failed")
 
         self.state = UpdateState.DOWNLOADING
-        url = manifest.artifact_url or manifest.artifact
+        url = (manifest.artifact_url or manifest.artifact or "").strip()
+        if url and not url.startswith("http"):
+            base = (self.relay_base_url or "").rstrip("/")
+            if not base:
+                raise ValueError(
+                    "artifact_url is relative and no relay base URL is set — connect first"
+                )
+            url = base + (url if url.startswith("/") else "/" + url)
         if not url.startswith("http"):
             raise ValueError("artifact_url must be an absolute HTTP(S) URL")
 
@@ -296,53 +306,115 @@ class UpdateClient:
 
     def install(self, artifact_path: Path, manifest: UpdateManifest) -> None:
         """
-        Stage -> commit version record.
-
-        Full binary replacement depends on packaging; this records the
-        verified update and extracts archives into updates/current when
-        the artifact is a tar/zip of the package tree.
+        Extract package and pip-install into the current Python environment.
+        Also stages under data_dir/updates/current for reference.
         """
+        import subprocess
+        import sys
         self.state = UpdateState.STAGING
         current = self.update_dir / "current"
         backup = self.update_dir / "previous"
-
+        extract_to = self.update_dir / "extract" / manifest.version
         try:
             if current.exists():
                 if backup.exists():
                     shutil.rmtree(backup, ignore_errors=True)
-                shutil.move(str(current), str(backup))
-
+                current.rename(backup)
             current.mkdir(parents=True, exist_ok=True)
-            # If tarball, extract; otherwise copy file
+            if extract_to.exists():
+                shutil.rmtree(extract_to, ignore_errors=True)
+            extract_to.mkdir(parents=True, exist_ok=True)
+
             name = artifact_path.name.lower()
             if name.endswith(".tar.gz") or name.endswith(".tgz"):
                 import tarfile
                 with tarfile.open(artifact_path, "r:gz") as tf:
-                    tf.extractall(current)
+                    tf.extractall(extract_to)
             elif name.endswith(".zip"):
                 import zipfile
                 with zipfile.ZipFile(artifact_path, "r") as zf:
-                    zf.extractall(current)
+                    zf.extractall(extract_to)
             else:
                 shutil.copy2(artifact_path, current / artifact_path.name)
 
-            self.state = UpdateState.HEALTH_CHECK
-            # Minimal health: directory non-empty
-            if not any(current.iterdir()):
-                raise RuntimeError("staged update is empty")
+            # Find package root (directory containing pyproject.toml or setup.py)
+            pkg_root = None
+            for root, dirs, files in os.walk(extract_to):
+                if "pyproject.toml" in files or "setup.py" in files or "nyx_client" in dirs:
+                    pkg_root = Path(root)
+                    if "pyproject.toml" in files or "setup.py" in files:
+                        break
+            if pkg_root is None:
+                pkg_root = extract_to
 
-            self.state = UpdateState.COMMIT
-            (self.update_dir / "installed_version").write_text(manifest.version)
-            log.info("update.installed", version=manifest.version)
+            # Copy tree to updates/current
+            for item in pkg_root.iterdir():
+                dest = current / item.name
+                if item.is_dir():
+                    if dest.exists():
+                        shutil.rmtree(dest, ignore_errors=True)
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+
+            install_target = str(pkg_root)
+            pip_ok = False
+            last_err = ""
+            for args in (
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+                 "--no-deps", install_target],
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+                 "--user", "--no-deps", install_target],
+                [sys.executable, "-m", "pip", "install", "-e", install_target],
+            ):
+                try:
+                    proc = subprocess.run(
+                        args, capture_output=True, text=True, timeout=180,
+                    )
+                    if proc.returncode == 0:
+                        pip_ok = True
+                        break
+                    last_err = (proc.stderr or proc.stdout or "")[-400:]
+                except Exception as exc:
+                    last_err = str(exc)
+
+            # Always copy package tree next to a .pth so next run can find it
+            shadow = self.update_dir / "site"
+            shadow.mkdir(parents=True, exist_ok=True)
+            pkg_src = pkg_root / "nyx_client"
+            if pkg_src.is_dir():
+                dest = shadow / "nyx_client"
+                if dest.exists():
+                    shutil.rmtree(dest, ignore_errors=True)
+                shutil.copytree(pkg_src, dest)
+                pth = shadow / "nyx_update.pth"
+                pth.write_text(str(shadow) + "\n")
+                # inject into current process
+                if str(shadow) not in sys.path:
+                    sys.path.insert(0, str(shadow))
+
+            (self.update_dir / "INSTALLED_VERSION").write_text(manifest.version + "\n")
+            (self.update_dir / "LAST_INSTALL.txt").write_text(
+                f"version={manifest.version}\n"
+                f"pip_ok={pip_ok}\n"
+                f"path={install_target}\n"
+                f"shadow={shadow}\n"
+                f"restart the client now\n"
+                f"pip_err={last_err[:300]}\n"
+            )
+            log.info(
+                "update.installed",
+                version=manifest.version,
+                path=install_target,
+                pip_ok=pip_ok,
+            )
             self.state = UpdateState.IDLE
+            if not pip_ok:
+                log.warning("update.pip_soft_fail", error=last_err[:200])
         except Exception as exc:
-            self.state = UpdateState.ROLLBACK
-            if backup.exists():
-                if current.exists():
-                    shutil.rmtree(current, ignore_errors=True)
-                shutil.move(str(backup), str(current))
             self.state = UpdateState.ERROR
-            raise RuntimeError(f"install failed, rolled back: {exc}") from exc
+            log.warning("update.install_failed", error=str(exc))
+            raise
 
     def _acceptable(self, m: UpdateManifest) -> bool:
         if m.product not in ("nyx-client", "nyx", "nyx_client"):
@@ -355,11 +427,11 @@ class UpdateClient:
         return True
 
     def _signature_ok(self, m: UpdateManifest) -> bool:
-        if not self.release_public_keys:
-            # No keys configured: accept only for explicit dev channel tests
+        keys = dict(self.release_public_keys or {})
+        if not keys:
             log.warning("update.no_release_keys_configured")
             return False
-        return verify_manifest_signature(m, self.release_public_keys)
+        return verify_manifest_signature(m, keys)
 
     @staticmethod
     def _http_get_json(url: str, timeout: float = 15.0) -> dict:

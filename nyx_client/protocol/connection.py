@@ -370,34 +370,6 @@ class ConnectionManager:
             body={"message_ids": list(message_ids)},
         )
 
-    async def post_signal(self, meeting_id: str, type_: str, payload: str) -> dict:
-        await self.ensure_connected()
-        return await self._transport.request(
-            "POST",
-            "/api/v3/signaling",
-            body={"meeting_id": meeting_id, "type": type_, "payload": payload},
-        )
 
-    async def pull_signals(self, meeting_id: str, since: int = 0) -> dict:
-        await self.ensure_connected()
-        return await self._transport.request(
-            "GET",
-            f"/api/v3/signaling?meeting_id={meeting_id}&since={since}",
-        )
 
-    async def create_meeting_remote(self, title: str) -> dict:
-        await self.ensure_connected()
-        return await self._transport.request(
-            "POST",
-            "/api/v3/meetings",
-            body={"title": title},
-        )
-
-    async def join_meeting_remote(self, code: str) -> dict:
-        await self.ensure_connected()
-        return await self._transport.request(
-            "POST",
-            f"/api/v3/meetings/{code}/join",
-            body={"code": code},
-        )
 

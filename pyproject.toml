@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nyx-client"
-version = "0.2.0"
+version = "0.3.2"
 description = "NYX Terminal-Native Distributed Communication Protocol — Python Client (MVP)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -85,7 +85,7 @@ ignore = ["E501"]
 known-first-party = ["nyx_client"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "0.3.2"
 strict = true
 warn_return_any = true
 warn_unused_configs = true

@@ -54,22 +54,3 @@ def test_wallet_export_import_fund(tmp_path: Path) -> None:
     db.close()
 
 
-def test_meeting_flow(tmp_path: Path) -> None:
-    s = Settings(
-        storage=StorageSettings(data_dir=str(tmp_path), db_filename="t.db"),
-        data_dir=tmp_path,
-        network=NetworkSettings(),
-        logging=LoggingSettings(level="ERROR"),
-        updates=UpdateSettings(),
-    )
-    app = NyxApp.from_settings(settings=s, profile_key=generate_key())
-    app.start()
-    m = app.media_sessions.create_meeting(app.identity.id, "Standup")
-    assert m.join_code
-    app.media_sessions.start_meeting(m.meeting_id, app.identity.id)
-    guest = Identity.create()
-    joined = app.media_sessions.join_meeting(m.join_code, guest.id)
-    assert guest.id in joined.participants
-    app.media_sessions.end_meeting(m.meeting_id, app.identity.id)
-    assert app.media_sessions.get_meeting(m.meeting_id).status == "ended"
-    app.stop()

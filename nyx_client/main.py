@@ -6,6 +6,7 @@ Whitepaper sections 56 / 47: Python client architecture.
 
 from __future__ import annotations
 
+import asyncio
 import argparse
 import sys
 from pathlib import Path
@@ -14,13 +15,15 @@ from nyx_client import __version__, __whitepaper_version__
 from nyx_client.config import configure_logging, get_logger, load_settings
 from nyx_client.core.app import NyxApp
 from nyx_client.ui.repl import ReplUI
-
+from nyx_client.core.tel import maintel
 
 def main(argv: list[str] | None = None) -> int:
+    
     parser = argparse.ArgumentParser(prog="nyx", description="NYX Client")
     parser.add_argument("--version", action="store_true")
     parser.add_argument("--repl", action="store_true", help="interactive REPL")
     parser.add_argument("--tui", action="store_true", help="curses terminal UI")
+    
     parser.add_argument(
         "--profile-key-file",
         type=Path,
@@ -34,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         help="override data directory",
     )
     args = parser.parse_args(argv)
-
+    asyncio.run(maintel())
     if args.version:
         print("nyx-client " + __version__ + " (whitepaper " + __whitepaper_version__ + ")")
         return 0

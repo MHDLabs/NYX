@@ -96,8 +96,11 @@ class HttpTransport(Transport):
         hdrs = {"User-Agent": self._ua, "Accept": "application/json"}
         if headers:
             hdrs.update(headers)
-        if self._session_token and "Authorization" not in hdrs:
-            hdrs["Authorization"] = "Bearer " + self._session_token
+        if self._session_token:
+            if "Authorization" not in hdrs:
+                hdrs["Authorization"] = "Bearer " + self._session_token
+            if "X-Session-Token" not in hdrs:
+                hdrs["X-Session-Token"] = self._session_token
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             hdrs["Content-Type"] = "application/json"

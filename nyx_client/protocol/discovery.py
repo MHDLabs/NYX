@@ -87,28 +87,29 @@ def normalize_endpoint(endpoint: str) -> str:
 
 def measure_latency(endpoint: str, timeout: float = 3.0) -> tuple[bool, float]:
     """
-    TCP/TLS handshake timing as latency proxy (whitepaper Section 15).
-    Returns (reachable, latency_ms).
+    Prefer HTTP GET /api/v3/health (works for subdirectory installs).
+    Fall back to TCP handshake. Returns (reachable, latency_ms).
     """
-    url = normalize_endpoint(endpoint)
+    url = normalize_endpoint(endpoint).rstrip("/")
+    health = url + "/api/v3/health"
+    start = time.perf_counter()
+    try:
+        req = urllib.request.Request(health, method="GET", headers={"Accept": "application/json", "User-Agent": "nyx-client/probe"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _ = resp.read(256)
+            ms = (time.perf_counter() - start) * 1000
+            return True, ms
+    except Exception:
+        pass
+    # TCP fallback
     parsed = urlparse(url)
     host = parsed.hostname or ""
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     if not host:
         return False, 9999.0
-
     start = time.perf_counter()
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
-        if parsed.scheme == "https":
-            ctx = ssl.create_default_context()
-            try:
-                sock = ctx.wrap_socket(sock, server_hostname=host)
-            except ssl.SSLError:
-                # Still count TCP success with high latency penalty path
-                sock.close()
-                ms = (time.perf_counter() - start) * 1000
-                return True, ms + 500  # TLS failed but host reachable
         sock.close()
         ms = (time.perf_counter() - start) * 1000
         return True, ms
@@ -260,9 +261,13 @@ class ServerDirectory:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode())
-                items = data if isinstance(data, list) else data.get("servers", [])
+                items = data if isinstance(data, list) else (
+                    data.get("servers") or data.get("peers") or []
+                )
                 if items:
-                    return self.merge_discovery(items, source="relay:" + endpoint)
+                    n = self.merge_discovery(items, source="relay:" + endpoint)
+                    log.info("discovery.fetched", endpoint=endpoint, added=n, total=len(self.servers))
+                    return n
             except Exception as exc:
                 log.debug("discovery.fetch_failed", url=url, error=str(exc))
                 continue

@@ -18,5 +18,5 @@ Extension points for future phases already exist as packages:
   plugins/, ai/, update/, sync/
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.2"
 __whitepaper_version__ = "3.0"
