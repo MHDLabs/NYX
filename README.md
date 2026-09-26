@@ -78,7 +78,7 @@ The goal is to keep the core communication system small.
 
 The current architectural and technical vision is documented in the NYX whitepaper.
 
-**[Read the Whitepaper](whitepaper.html)**
+**[Read the Whitepaper](index.html)**
 
 The whitepaper is an interactive HTML document designed to be read directly in a browser and is also suitable for printing or exporting to PDF.
 
