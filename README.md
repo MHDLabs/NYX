@@ -1,164 +1,145 @@
-# NYX - Terminal-Native Secure Communication
+# NYX
 
-NYX is a secure, terminal-native distributed communication protocol with end-to-end encryption. This implementation provides both a PHP relay server and a Python client for secure messaging.
+> A lightweight, terminal-native communication platform for developers and technical users.
 
-**Version**: 0.0.7
+NYX is an open-source experiment focused on building a simple messaging system around the terminal.
 
-## Project Structure
+The idea is somewhere between **IRC, Signal, and modern messaging platforms**, but with a strong focus on terminal usage, simplicity, privacy, and developer-oriented workflows.
 
-```
-NYX/
-├── server/              # PHP Relay Server
-│   ├── index.php       # Entry point
-│   ├── router.php      # Router for built-in server
-│   ├── db.php          # PDO database connection
-│   ├── helpers.php     # Shared utilities
-│   ├── register.php    # Legacy registration endpoint
-│   ├── send.php        # Legacy message send endpoint (updated for E2EE)
-│   ├── sync.php        # Legacy message sync endpoint (updated for E2EE)
-│   └── api/            # v3 API endpoints
-│       ├── health.php
-│       ├── session.php
-│       ├── messages.php
-│       ├── keys.php
-│       ├── discovery.php
-│       ├── profile.php
-│       └── manifest.php
-├── client/             # Python Client
-│   ├── main.py         # Entry point (with password-based DB encryption)
-│   ├── config.py       # Configuration management
-│   ├── crypto.py       # X25519 + Ed25519 + ChaCha20-Poly1305 (PyNaCl)
-│   ├── db.py           # Local SQLite storage (with optional encryption)
-│   ├── commands.py     # Command handlers (E2EE message send/sync)
-│   ├── ui.py           # TUI and REPL interface
-│   ├── requirements.txt
-│   └── pyproject.toml
-├── Dockerfile          # Server container config
-├── railway.json        # Railway deployment config
-└── .gitignore          # Git exclusion rules
-```
+The project is intentionally being kept small. NYX is not trying to become a massive platform with every possible feature.
 
-## Features
+## Current Direction
 
-### Server (PHP)
-- **RESTful API**: Clean API for message relay
-- **Relay Mechanism**: Securely relay encrypted messages between clients
-- **Ed25519 Signature Verification**: Proper authentication via libsodium
-- **Health Checks**: Built-in monitoring endpoints
-- **Flexible Deployment**: Supports Docker and Railway
-- **Portability**: Uses PHP built-in server for easy setup
+The current direction of NYX is a clean rebuild around a few core ideas:
 
-### Client (Python)
-- **End-to-End Encryption**: X25519 key exchange + ChaCha20-Poly1305 AEAD (via PyNaCl)
-- **Identity Management**: Ed25519-based identities (nyx1...)
-- **Dual UI**: Interactive REPL and rich TUI (Textual)
-- **Encrypted Local Storage**: SQLite database with optional Fernet encryption
-- **Asynchronous**: Non-blocking message synchronization
-- **Local profile**: Display name + avatar stored in SQLite
-- **Groups**: Create / join / list groups with local messaging
-- **v3 API client**: Session auth, envelope send/sync with legacy fallback
+* Terminal-first user experience
+* Lightweight architecture
+* Rust-based client
+* Language-independent server protocol
+* Private and secure messaging
+* Simple federation/server model where practical
+* Developer-friendly communication
+* Minimal dependencies and unnecessary complexity
+* Extensible protocol instead of locking the ecosystem to one server language
 
-## Installation
+The client is planned to be written in **Rust**, primarily because it provides a strong foundation for a fast, lightweight, portable terminal application.
 
-### Prerequisites
-- Python 3.11+
-- PHP 8.1+ with **sodium extension** (required for Ed25519 verification)
-- SQLite3
+The server side is intentionally **not tied to one programming language**. A server implementation could be written in PHP, Python, JavaScript/TypeScript, Rust, or another suitable language as long as it follows the NYX protocol.
 
-### Client Setup
+## Terminal First
 
-1. Clone the repository and navigate to `client/`:
-```bash
-git clone https://github.com/openclaw02221/NYX.git
-cd NYX/client
+The terminal is not just another interface for NYX.
+
+It is the primary interface.
+
+The client is designed around the kind of workflow where a user can open a terminal, connect to a server, communicate with others, and manage the application without needing a graphical desktop environment.
+
+The TUI direction is based on the strongest parts of the previous NYX prototypes, while the previous experimental architecture is not being carried forward as-is.
+
+## Protocol First
+
+NYX aims to define a clear protocol between clients and servers rather than forcing everyone to use the same backend implementation.
+
+This means different server implementations could coexist:
+
+```text
+             NYX Protocol
+                  │
+       ┌──────────┼──────────┐
+       │          │          │
+     PHP       Python     JavaScript
+       │          │          │
+     Server     Server     Server
 ```
 
-2. Setup virtual environment and install dependencies:
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+The protocol is the common layer.
+
+This makes it possible to build different server implementations without changing the client itself.
+
+## Security & Privacy
+
+Security is an important part of the project, but NYX does not claim to provide perfect security, perfect anonymity, or impossible-to-break infrastructure.
+
+The project will prefer established cryptographic approaches and simple, understandable security boundaries over custom cryptography or unnecessarily complicated systems.
+
+Features such as encryption, identity verification, server trust, and abuse protection will be introduced only when they can be designed and implemented realistically.
+
+## Optional Ecosystem Features
+
+Some ideas that appeared in earlier NYX designs are intentionally not part of the current core architecture.
+
+For example, reputation, AI, decentralized infrastructure, or other specialized capabilities may eventually exist as **optional users, services, extensions, or protocol participants with specific roles/tags**, rather than becoming mandatory parts of the entire system.
+
+The goal is to keep the core communication system small.
+
+## Documentation
+
+### Whitepaper
+
+The current architectural and technical vision is documented in the NYX whitepaper.
+
+**[Read the Whitepaper](whitepaper.html)**
+
+The whitepaper is an interactive HTML document designed to be read directly in a browser and is also suitable for printing or exporting to PDF.
+
+### Presentation
+
+A short English presentation covering the project and its architecture is also available.
+
+**[View the Presentation](slides.pdf)**
+
+## Roadmap
+
+NYX is currently in a **research and redesign phase**.
+
+The immediate goal is not to rush into implementation. The architecture, protocol boundaries, terminal interface, and project scope need to be settled first.
+
+A simplified development direction is:
+
+```text
+Research & Design
+       │
+       ▼
+Protocol Definition
+       │
+       ▼
+Rust TUI Client
+       │
+       ▼
+Minimal Server
+       │
+       ▼
+Messaging & Identity
+       │
+       ▼
+Security Hardening
+       │
+       ▼
+Federation / Extensions
 ```
 
-3. Run the client:
-```bash
-python main.py        # Starts TUI (prompts for encryption password)
-python main.py --repl # Starts REPL
-python main.py --no-encrypt  # Disable database encryption
-```
+The roadmap is intentionally flexible. Features will be added only when they have a clear purpose and can be implemented without turning the project into unnecessary infrastructure.
 
-### Server Setup
+## Project Status
 
-1. Navigate to the server directory:
-```bash
-cd NYX/server
-```
+**NYX is currently paused.**
 
-2. Run using PHP's built-in server (ensure sodium extension is enabled):
-```bash
-php -S localhost:8000 router.php
-```
+The project is being put on hold while the current design is reviewed and other work takes priority.
 
-3. Or deploy using Docker:
-```bash
-docker build -t nyx-server .
-docker run -p 8000:8000 nyx-server
-```
+Development may remain paused for an extended period, potentially for **up to a year or more**.
 
-## Usage
+This repository therefore represents the current project direction and documentation, not a promise of active development.
 
-### Client Commands (REPL/TUI)
+When development resumes, the implementation will be built around the simplified architecture described in the current documentation rather than attempting to preserve every feature from previous prototypes.
 
-```
-/help                  - Show all commands
-/status                - Show connection and identity status
-/identity              - Display your identity
-/contacts              - List all contacts
-/add <name> <id> [--public-key <hex>]  - Add a contact with their X25519 public key
-/send <id> <msg>       - Send an encrypted message
-/conversations         - List all conversations
-/messages <id>         - View messages in a conversation
-/sync                  - Sync and decrypt messages from server
-/groups                - List groups
-/create_group <name>   - Create a group
-/join_group <id>       - Join a group
-/gsend <id> <msg>      - Send group message
-/profile [name] [avatar]  - Show/set profile
-/exit                  - Exit the client
-```
+## Previous Prototypes
 
-### Adding Contacts
+NYX has gone through several experimental versions and architectural approaches.
 
-To send encrypted messages, you need the recipient's X25519 public key:
+Those versions were useful for exploring ideas, but they are **not considered the foundation of the current implementation**.
 
-```bash
-/add "Alice" nyx1abc123... --public-key a1b2c3d4...
-```
-
-The public key is the 32-byte X25519 public key in hex format (64 hex characters).
-
-### Encryption Password
-
-On first run, the client will prompt for an encryption password. This password is used to encrypt the local SQLite database using Fernet (AES-128). If you leave it empty, the database will not be encrypted.
-
-## Security
-
-- **End-to-End Encryption**: Messages are encrypted with X25519 + ChaCha20-Poly1305 before leaving your device
-- **Authentication**: Ed25519 signatures verify message integrity and sender identity
-- **Encrypted Local Storage**: Database encryption with password-derived keys (PBKDF2)
-- **Blind Relay**: Server never sees unencrypted message content
-- **Signature Verification**: Server validates Ed25519 signatures using libsodium
-
-## Deployment
-
-### Railway (Server)
-Deploy the server to Railway using the provided `railway.json` and `Dockerfile`.
-
-### Docker (Server)
-```bash
-docker build -t nyx-server .
-docker run -p 8000:8000 -e PORT=8000 nyx-server
-```
+The current direction intentionally starts from a cleaner and smaller architecture, while retaining useful lessons from the previous terminal interface experiments.
 
 ## License
-Open Source
+
+This project is open source. See the repository license for details.
